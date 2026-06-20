@@ -1,0 +1,30 @@
+@import url("https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&family=Poppins:wght@500;600;700&display=swap");
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  --bg: #f8f5ef;
+  --ink: #0f172a;
+  --panel: #ffffff;
+  --accent: #ef4444;
+  --cyan: #06b6d4;
+}
+
+body {
+  background: radial-gradient(circle at 15% 20%, #ffe8de, transparent 40%),
+    radial-gradient(circle at 90% 10%, #daf8ff, transparent 35%),
+    linear-gradient(180deg, var(--bg), #fff);
+  color: var(--ink);
+  font-family: "IBM Plex Sans", sans-serif;
+  min-height: 100vh;
+}
+
+.card {
+  @apply rounded-2xl border border-slate-200 bg-white/90 p-4 shadow-sm backdrop-blur;
+}
+
+.title {
+  font-family: "Poppins", sans-serif;
+}
