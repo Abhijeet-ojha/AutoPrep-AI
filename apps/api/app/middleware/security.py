@@ -77,7 +77,7 @@ def sanitize_user_input(text: str) -> str:
         Sanitized text
     """
     # Remove any potential SQL injection patterns (basic)
-    text = re.sub(r"('|(--)|(/\*)|(\*/)|(\bDROP\b)|(\bINSERT\b)|(\bUPDATE\b)|(\bDELETE\b))", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"('|(--)|(/\*)|(\*/)|(\bSELECT\b)|(\bDROP\b)|(\bINSERT\b)|(\bUPDATE\b)|(\bDELETE\b))", "", text, flags=re.IGNORECASE)
     
     # Limit length
     max_length = 10000

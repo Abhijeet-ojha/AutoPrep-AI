@@ -17,8 +17,11 @@ class LocalStorageBackend(StorageBackend):
     
     def _get_full_path(self, key: str) -> Path:
         """Get full filesystem path for key."""
-        # Sanitize key to prevent directory traversal
-        safe_key = key.replace("..", "").lstrip("/")
+        # Prevent directory traversal
+        if ".." in key:
+            raise ValueError(f"Directory traversal detected in key: {key}")
+            
+        safe_key = key.lstrip("/")
         full_path = self.base_path / safe_key
         
         # Ensure path is within base_path
@@ -40,7 +43,7 @@ class LocalStorageBackend(StorageBackend):
             with open(path, "wb") as f:
                 f.write(content.read())
         
-        return str(path.relative_to(self.base_path))
+        return str(path.relative_to(self.base_path).as_posix())
     
     def load(self, key: str) -> bytes:
         """Load content from local filesystem."""

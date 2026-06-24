@@ -1,97 +1,105 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from datetime import datetime
-from threading import Lock
+import io
+import os
+import shutil
+import logging
+from datetime import datetime, timedelta
 from typing import Any
-from uuid import uuid4
 
 import pandas as pd
+from uuid import uuid4
+from app.core.config import settings
+from app.storage.local import LocalStorageBackend
+
+logger = logging.getLogger(__name__)
 
 
-@dataclass
-class DatasetVersion:
-    version: int
-    timestamp: datetime
-    action: str
-    details: dict[str, Any]
-    dataframe: pd.DataFrame
-
-
-@dataclass
 class DatasetState:
-    dataset_id: str
-    file_name: str
-    file_size_bytes: int
-    created_at: datetime
-    current_df: pd.DataFrame
-    versions: list[DatasetVersion] = field(default_factory=list)
+    def __init__(
+        self,
+        dataset_id: str,
+        file_name: str,
+        file_size_bytes: int,
+        created_at: datetime,
+        expires_at: datetime,
+        metadata: dict[str, Any],
+        file_path: str,
+    ):
+        self.dataset_id = dataset_id
+        self.file_name = file_name
+        self.file_size_bytes = file_size_bytes
+        self.created_at = created_at
+        self.expires_at = expires_at
+        self.metadata = metadata
+        self.file_path = file_path
 
 
 class InMemoryDatasetStore:
     def __init__(self) -> None:
-        self._items: dict[str, DatasetState] = {}
-        self._lock = Lock()
+        self._storage_backend = LocalStorageBackend(
+            base_path=os.path.join(settings.storage_path, "temp")
+        )
+        self.active_sessions: dict[str, DatasetState] = {}
 
-    def create(self, file_name: str, file_size_bytes: int, df: pd.DataFrame) -> DatasetState:
-        with self._lock:
-            dataset_id = str(uuid4())
-            state = DatasetState(
-                dataset_id=dataset_id,
-                file_name=file_name,
-                file_size_bytes=file_size_bytes,
-                created_at=datetime.utcnow(),
-                current_df=df.copy(),
-            )
-            state.versions.append(
-                DatasetVersion(
-                    version=1,
-                    timestamp=datetime.utcnow(),
-                    action="ingestion",
-                    details={"rows": int(df.shape[0]), "columns": int(df.shape[1])},
-                    dataframe=df.copy(),
-                )
-            )
-            self._items[dataset_id] = state
-            return state
+    def create(
+        self,
+        file_name: str,
+        file_size_bytes: int,
+        df: pd.DataFrame,
+        metadata: dict[str, Any],
+    ) -> DatasetState:
+        dataset_id = str(uuid4())
+        expires_at = datetime.utcnow() + timedelta(minutes=settings.session_expiration_minutes)
+        
+        # Ensure temporary CSV is saved
+        file_path = f"{dataset_id}/cleaned.csv"
+        csv_buffer = io.BytesIO()
+        df.to_csv(csv_buffer, index=False)
+        self._storage_backend.save(file_path, csv_buffer.getvalue())
 
-    def get(self, dataset_id: str) -> DatasetState:
-        state = self._items.get(dataset_id)
-        if state is None:
-            raise KeyError(f"Dataset {dataset_id} not found")
+        state = DatasetState(
+            dataset_id=dataset_id,
+            file_name=file_name,
+            file_size_bytes=file_size_bytes,
+            created_at=datetime.utcnow(),
+            expires_at=expires_at,
+            metadata=metadata,
+            file_path=file_path
+        )
+        self.active_sessions[dataset_id] = state
         return state
 
-    def add_version(self, dataset_id: str, action: str, details: dict[str, Any], df: pd.DataFrame) -> DatasetVersion:
-        with self._lock:
-            state = self.get(dataset_id)
-            version = len(state.versions) + 1
-            entry = DatasetVersion(
-                version=version,
-                timestamp=datetime.utcnow(),
-                action=action,
-                details=details,
-                dataframe=df.copy(),
-            )
-            state.current_df = df.copy()
-            state.versions.append(entry)
-            return entry
+    def get(self, dataset_id: str) -> DatasetState:
+        self.cleanup_expired()
+        
+        state = self.active_sessions.get(dataset_id)
+        if state is None:
+            raise KeyError(f"Dataset session {dataset_id} not found or has expired")
+        return state
 
-    def rollback(self, dataset_id: str, version: int) -> DatasetVersion:
-        with self._lock:
-            state = self.get(dataset_id)
-            match = next((v for v in state.versions if v.version == version), None)
-            if match is None:
-                raise KeyError(f"Version {version} not found")
-            state.current_df = match.dataframe.copy()
-            rollback_entry = DatasetVersion(
-                version=len(state.versions) + 1,
-                timestamp=datetime.utcnow(),
-                action="rollback",
-                details={"rollback_to": version},
-                dataframe=match.dataframe.copy(),
-            )
-            state.versions.append(rollback_entry)
-            return rollback_entry
+    def delete(self, dataset_id: str) -> None:
+        """Evict session and physically remove temp files."""
+        state = self.active_sessions.pop(dataset_id, None)
+        if state:
+            session_dir = os.path.join(settings.storage_path, "temp", dataset_id)
+            if os.path.exists(session_dir):
+                try:
+                    shutil.rmtree(session_dir)
+                    logger.info(f"Deleted temp directory: {session_dir}")
+                except Exception as e:
+                    logger.error(f"Failed to delete temp directory {session_dir}: {e}")
+
+    def cleanup_expired(self) -> None:
+        """Delete active sessions that have passed their expiration date."""
+        now = datetime.utcnow()
+        expired_ids = [
+            sid for sid, state in self.active_sessions.items()
+            if state.expires_at < now
+        ]
+        for sid in expired_ids:
+            logger.info(f"Session {sid} has expired. Cleaning up.")
+            self.delete(sid)
 
 
 dataset_store = InMemoryDatasetStore()

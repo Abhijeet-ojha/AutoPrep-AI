@@ -11,3 +11,7 @@ class RollbackRequest(BaseModel):
 
 class ChatRequest(BaseModel):
     question: str
+
+
+class CopilotRequest(BaseModel):
+    message: str
