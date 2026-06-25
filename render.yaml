@@ -1,0 +1,21 @@
+services:
+  - type: web
+    name: autoprep-ai-api
+    runtime: docker
+    dockerfilePath: ./apps/api/Dockerfile
+    dockerContext: ./apps/api
+    plan: free
+    envVars:
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: ENVIRONMENT
+        value: production
+      - key: LOG_LEVEL
+        value: INFO
+      - key: STORAGE_BACKEND
+        value: local
+      - key: SESSION_TTL_HOURS
+        value: "24"
+      - key: CORS_ORIGINS
+        value: "https://auto-prep-ai-project.vercel.app,https://*.vercel.app"
+    healthCheckPath: /health

@@ -26,9 +26,18 @@ app = FastAPI(
 # Add middleware
 app.add_middleware(RequestLoggingMiddleware)
 app.add_middleware(SecurityMiddleware)
+# Determine allowed origins: Vercel prod URL + localhost for dev
+_cors_origins = [
+    "https://auto-prep-ai-project.vercel.app",
+    "http://localhost:3000",
+    "http://127.0.0.1:3000",
+]
+if hasattr(settings, 'cors_origins') and settings.cors_origins:
+    _cors_origins = [o.strip() for o in settings.cors_origins.split(',') if o.strip()]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # TODO: Configure specific origins in production
+    allow_origins=_cors_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],

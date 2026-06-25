@@ -21,6 +21,9 @@ class Settings(BaseSettings):
     secret_key: str = "dev-secret-key-change-in-production"
     max_upload_size_mb: int = 100
 
+    # CORS (comma-separated list of allowed origins)
+    cors_origins: str = ""
+
     # Observability
     log_level: str = "INFO"
     enable_tracing: bool = False
