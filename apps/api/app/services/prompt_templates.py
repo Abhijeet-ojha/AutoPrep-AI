@@ -1,126 +1,213 @@
 """Prompt templates for AI and Fallback copilot providers."""
 
-def build_copilot_prompt(question: str, context: dict, insights: list[dict]) -> str:
-    """
-    Builds a structured prompt for the Gemini Copilot using metadata-only context and insights.
-    Never exposes raw records.
-    """
-    from app.services.insight_engine import (
-        suggest_advanced_features,
-        recommend_models,
-        generate_health_explanation,
-        get_structured_cleaning_plan
+INTENT_TEMPLATES = {
+    "Dataset Comparison": """
+Follow this format strictly:
+# Dataset Comparison Overview
+Provide a short introduction comparing the two datasets.
+
+## Comparison Table
+Include a Markdown table comparing dimensions, missing value counts, health score, ML readiness, etc.
+
+## Similarities
+- Bullet 1
+- Bullet 2
+
+## Differences
+- Bullet 1
+- Bullet 2
+
+## ML Perspective
+Provide a structured assessment of modeling implications for both datasets.
+
+## Final Recommendation
+Provide actionable recommendations.
+""",
+    "Cleaning": """
+Follow this format strictly:
+# Cleaning Recommendations
+Provide a short introduction.
+
+## Issues Found
+- Bullet 1
+- Bullet 2
+
+## Recommended Cleaning
+Provide a Markdown table or list of steps.
+
+## Why These Methods
+Provide reasoning.
+
+## Expected Impact
+Describe expected improvements to health score and model performance.
+
+## Summary
+Provide a concise conclusion.
+""",
+    "Dataset Analysis": """
+Follow this format strictly:
+# Dataset Analysis Report
+
+Provide a brief introduction (1-2 sentences) about the dataset and its detected domain.
+
+## Dataset Overview
+Create a Markdown table with the following properties:
+| Property | Value |
+| --- | --- |
+| Filename | [Filename] |
+| Row Count | [Rows] |
+| Column Count | [Columns] |
+| File Size | [Size in Bytes] |
+
+## Overall Health
+Provide a structured assessment of the overall dataset health, explaining what the raw and cleaned health scores mean from an analytical perspective.
+
+## Data Quality Summary
+Discuss major data quality findings like missing values, duplicates, and outliers. Use a bulleted list with bold metric counts.
+
+## Cleaning Impact
+Compare the dataset before and after auto-cleaning. Use a Markdown table showing row counts, treated outliers, filled missing values, etc.
+
+## Dataset Composition
+Describe column semantic types (e.g. numeric, categorical, datetime) and their profiles (cardinality, missing percentage).
+
+## Machine Learning Readiness
+Assess the ML readiness score. Explain which ML task is recommended (e.g., Classification, Regression) and discuss potential validation strategies.
+
+## Recommendations
+Provide 3-5 actionable, numbered recommendations for further preparation or engineering.
+
+## Final Summary
+Provide a concise, professional conclusion.
+""",
+    "Model Recommendation": """
+Follow this format strictly:
+# Machine Learning Model Recommendations
+Identify target variable and problem type.
+
+## Problem Type
+Indicate regression, classification, clustering, etc.
+
+## Suggested Models
+Provide a comparison table of suggested models.
+
+## Why
+Explain reasoning.
+
+## Evaluation Metrics
+Identify relevant evaluation metrics.
+
+## Recommended Pipeline
+Provide recommended training/preprocessing pipeline.
+""",
+    "Feature Engineering": """
+Follow this format strictly:
+# Feature Engineering Plan
+Provide introduction.
+
+## Candidate Features
+Provide a Markdown table of candidate features.
+
+## Reasoning
+Explain the reasoning.
+
+## Expected Benefit
+Describe expected performance gains.
+
+## Implementation Ideas
+Include code snippets or suggestions.
+"""
+}
+
+def format_cleaning_impact(impact: dict) -> str:
+    if not impact:
+        return "- No cleaning impact data available.\n"
+    res = ""
+    res += f"- Original Rows: {impact.get('rows_before')}, Cleaned Rows: {impact.get('rows_after')}\n"
+    res += f"- Missing Values Fixed: {impact.get('missing_values_fixed', 0)}\n"
+    res += f"- Duplicates Removed: {impact.get('duplicates_removed', 0)}\n"
+    res += f"- Outliers Treated: {impact.get('outliers_treated', 0)}\n"
+    res += f"- Columns Modified: {impact.get('columns_modified', 0)}\n"
+    res += f"- Cells Modified: {impact.get('cells_modified', 0)}\n"
+    return res
+
+def format_column_schema(columns_stats: dict) -> str:
+    if not columns_stats:
+        return "- No column profile information available.\n"
+    res = ""
+    for col, info in columns_stats.items():
+        res += f"- {col} (Type: {info.get('type')}, Null%: {info.get('missing_pct', 0.0):.1f}%, Cardinality: {info.get('cardinality', info.get('entropy', 0))})\n"
+    return res
+
+def build_copilot_prompt(question: str, safe_context: dict) -> str:
+    intents = safe_context.get("detected_intents", [])
+    primary_intent = intents[0]["intent"] if intents else "General Discussion"
+    
+    # Select template
+    template_instruction = INTENT_TEMPLATES.get(
+        primary_intent,
+        "Provide a professional, structured analysis matching the user's question."
     )
     
-    dataset_summary = context.get("dataset_summary", {})
-    filename = dataset_summary.get("filename", "unknown")
-    rows = dataset_summary.get("rows", 0)
-    cols = dataset_summary.get("columns", 0)
-    raw_health_score = context.get("raw_health_score", 100)
-    raw_health_label = context.get("raw_health_label", "Unknown")
-    cleaned_health_score = context.get("cleaned_health_score", 100)
-    cleaned_health_label = context.get("cleaned_health_label", "Excellent")
-    cleaning_impact = context.get("cleaning_impact", {})
-    ml_score = context.get("ml_readiness_score", 50)
-
-    # Format cleaning impact
-    cleaning_impact_str = ""
-    if cleaning_impact:
-        cleaning_impact_str += f"- Original Rows: {cleaning_impact.get('rows_before')}, Cleaned Rows: {cleaning_impact.get('rows_after')}\n"
-        cleaning_impact_str += f"- Missing Values Fixed: {cleaning_impact.get('missing_values_fixed', 0)}\n"
-        cleaning_impact_str += f"- Duplicates Removed: {cleaning_impact.get('duplicates_removed', 0)}\n"
-        cleaning_impact_str += f"- Outliers Treated: {cleaning_impact.get('outliers_treated', 0)}\n"
-        cleaning_impact_str += f"- Columns Modified: {cleaning_impact.get('columns_modified', 0)}\n"
-        cleaning_impact_str += f"- Cells Modified: {cleaning_impact.get('cells_modified', 0)}\n"
-    else:
-        cleaning_impact_str = "- No cleaning impact data available.\n"
-    
-    profile_summary = dict(context.get("profile_summary", {}))
-    profile_summary["column_semantics"] = context.get("column_semantics", {})
-    
-    # Pre-compute advisors deterministically
-    features = suggest_advanced_features(profile_summary)
-    models = recommend_models(profile_summary)
-    health_explain = generate_health_explanation(context)
-    cleaning_plan = get_structured_cleaning_plan(context)
-    
-    # Format pre-computed deterministic insights
-    insights_str = ""
-    for idx, ins in enumerate(insights, 1):
-        insights_str += f"- [{idx}] {ins['title']}: {ins['evidence']} (Rec: {ins['recommendation']})\n"
-        
-    # Format cleaning logs
-    cleaning_str = ""
-    for log in context.get("cleaning_history", []):
-        col_str = f" on column '{log.get('column')}'" if log.get('column') else ""
-        cleaning_str += f"- Action: {log.get('action')}{col_str} (Method: {log.get('method')}, Reason: {log.get('reason')})\n"
-        
-    # Format columns schema profile
-    columns_str = ""
-    column_semantics = context.get("column_semantics", {})
-    for info in profile_summary.get("columns", []):
-        col = info.get("column")
-        sem_type_str = f", Semantic Type: {column_semantics.get(col)}" if col in column_semantics else ""
-        columns_str += f"- {col} (Type: {info.get('dtype')}{sem_type_str}, Null%: {info.get('missing_pct', 0.0):.1f}%, Cardinality: {info.get('cardinality')})\n"
-        
-    # Format structured cleaning plan
-    plan_str = ""
-    for idx, step in enumerate(cleaning_plan, 1):
-        plan_str += f"Step {idx}: Action={step['action']}, Column={step['column']}, Method={step['method']}, Reason={step['reason']}\n"
-
-    # Format feature suggestions
+    # Pre-calculated features & models
+    features = safe_context.get("features_analysis", {}).get("feature_importances", [])
     features_str = ""
-    for feat in features:
-        features_str += f"- Feature: {feat['feature_name']}\n  Reason: {feat['reason']}\n  Benefit: {feat['expected_benefit']}\n  Confidence: {feat['confidence_score']:.2f}\n"
-
-    # Format model recommendations
-    model_str = f"Task Identified: {models.get('task')}\n"
-    if models.get("error"):
-        model_str += f"Warning: {models['error']}\n"
-    else:
-        for idx, rec in enumerate(models.get("recommendations", []), 1):
-            model_str += f"{idx}. Model: {rec['model']}\n   Explanation: {rec['explanation']}\n"
+    for idx, f in enumerate(features, 1):
+        features_str += f"- [{idx}] Feature: {f['feature']} (Importance: {f['importance']})\n"
         
-    prompt = f"""You are the AutoPrep AI Dataset Copilot, an expert backend engineer, data analyst, and ML platform lead.
-Your role is to help the user prepare their dataset for modeling.
+    ml_recs = safe_context.get("ml_recommendations", {})
+    models_str = ""
+    for idx, rec in enumerate(ml_recs.get("suggested_algorithms", []), 1):
+        models_str += f"- [{idx}] Model: {rec['model']} - {rec['explanation']}\n"
 
-Here is the privacy-safe METADATA context of the user's dataset:
-- File Name: {filename}
-- Shape: {rows} rows, {cols} columns
-- Raw Health Score: {raw_health_score}/100 ({raw_health_label})
-- Cleaned Health Score: {cleaned_health_score}/100 ({cleaned_health_label})
-- ML Readiness Score: {ml_score}/100
+    prompt = f"""You are the AutoPrep AI Dataset Copilot, an expert data analyst and machine learning engineer.
+Your role is to help the user prepare their dataset.
+
+Here is the privacy-safe AUTHORITATIVE METADATA context of the user's dataset (Calculated Deterministically on the Backend):
+- File Name: {safe_context.get('dataset_summary', {}).get('filename', 'unknown')}
+- Shape: {safe_context.get('dataset_summary', {}).get('rows', 0)} rows, {safe_context.get('dataset_summary', {}).get('columns', 0)} columns
+- Raw Health Score: {safe_context.get('raw_health_score', 100)}/100 ({safe_context.get('raw_health_label', 'Unknown')})
+- Cleaned Health Score: {safe_context.get('cleaned_health_score', 100)}/100 ({safe_context.get('cleaned_health_label', 'Excellent')})
+- ML Readiness Score: {safe_context.get('ml_readiness_score', 50)}/100
+- Recommended ML Task: {ml_recs.get('task', 'Unknown')}
+- Detected Dataset Domain: {safe_context.get('detected_domain', 'General Tabular Dataset')} (Confidence: {safe_context.get('domain_confidence', 0.0)})
 
 Cleaning Impact Tracker:
-{cleaning_impact_str}
-
-Detailed Health score explanation:
-{health_explain}
-
-Structured Cleaning Plan Recommendations:
-{plan_str if plan_str else "No cleaning steps required."}
-
-Deterministic Quality Insights (pre-computed):
-{insights_str if insights_str else "No quality alerts detected."}
+{format_cleaning_impact(safe_context.get('cleaning_impact', {}))}
 
 Active Column Schema:
-{columns_str if columns_str else "No column profile information available."}
+{format_column_schema(safe_context.get('columns_stats', {}))}
 
-Dynamic Feature Engineering Suggestions:
-{features_str if features_str else "No advanced feature suggestions."}
+Pre-Calculated Diagnostic Feature Importance:
+{features_str if features_str else "No target column feature importances calculated."}
 
-Model Recommendation Engine Output:
-{model_str}
+Pre-Calculated ML Advisor Recommendations:
+{models_str if models_str else "No models suggested."}
 
-Dataset Version & Cleaning History:
-{cleaning_str if cleaning_str else "No cleaning history record."}
+Conversation Memory Context:
+{safe_context.get('conversation_context', {})}
 
 User Question: "{question}"
 
-Instructions:
-1. Provide a professional, concise explanation, data summary, or cleaning plan matching the user's question.
-2. Rely ONLY on the metadata and insights provided above. Do not assume or request raw data rows.
-3. Suggest Python/Pandas code or cleaning actions when applicable. Refer directly to the structured cleaning plans, feature suggestions, or model recommendations in your advice.
-4. Keep your response direct, structured, and easy to read.
+PRIMARY DETECTED INTENT: {primary_intent}
+All Detected Intents: {', '.join([f"{item['intent']} ({item['confidence']})" for item in intents])}
+
+INSTRUCTIONS FOR INTENT "{primary_intent}":
+{template_instruction}
+
+RESPONSE FORMATTING RULES:
+1. Short introduction (1-2 sentences).
+2. Structured headings matching the sections above.
+3. Use Markdown tables when comparing or showing stats. Avoid raw lists of numbers.
+4. Use bullet lists for descriptions.
+5. End with actionable recommendations and a concise conclusion.
+6. Avoid large walls of text. Prefer: Tables -> Bullets -> Paragraphs.
+
+STRICT GUARDRAILS:
+* You are NOT responsible for calculating statistics. Rely strictly on pre-computed values.
+* If statistics or diagnostics are missing, state that they are unavailable; NEVER invent/hallucinate values.
+* Never repeat information, statistics, or tables.
+* Never expose implementation details.
+* Never use forbidden phrases such as "the backend...", "according to the system...", "discrepancy...", "internal...", "prompt...", "implementation...". Explain findings from the user's perspective (e.g. "AutoPrep AI has identified...", "In this dataset...").
 """
     return prompt.strip()

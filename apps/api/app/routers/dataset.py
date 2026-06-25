@@ -300,9 +300,12 @@ def download_cleaning_log(session_id: str, request: Request):
         raise HTTPException(status_code=status.HTTP_410_GONE, detail=str(exc))
 
 
+from app.schemas.requests import ExportPDFRequest
+
 @router.post("/{session_id}/copilot")
 def copilot_chat(session_id: str, request: CopilotRequest, req_raw: Request):
     from app.services.copilot_service import ask_copilot
+    from app.services.security import sanitize_prompt
     try:
         state = dataset_store.get(session_id)
     except KeyError as exc:
@@ -314,8 +317,435 @@ def copilot_chat(session_id: str, request: CopilotRequest, req_raw: Request):
         if expected and token != expected:
             raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid session token")
     
-    result = ask_copilot(session_id, request.message)
+    sanitized_prompt = sanitize_prompt(request.message)
+    result = ask_copilot(session_id, sanitized_prompt)
     return result
+
+
+@router.post("/{session_id}/copilot/stream")
+def copilot_chat_stream(session_id: str, request: CopilotRequest, req_raw: Request):
+    import json
+    import time
+    from app.services.analytics_engine import get_dataset_analytics, evaluate_analytics_query
+    from app.services.dataset_domain_detector import detect_dataset_domain
+    from app.services.intent_router import route_intents
+    from app.services.conversation_context import resolve_contextual_question, update_conversation_context
+    from app.services.suggestions import generate_suggestions
+    from app.services.query_planner import plan_query_mode
+    from app.services.ai_context_builder import build_ai_context
+    from app.services.prompt_templates import build_copilot_prompt
+    from app.services.gemini_sanitizer import sanitize_for_gemini
+    from app.services.gemini_service import get_copilot_provider
+    from app.services.security import sanitize_prompt
+    from app.services.analytics_logger import AnalyticsLogger
+    from app.services.cache_service import get_cached_val, set_cached_val
+    from app.services.response_validator import validate_and_repair_response
+    from app.services.conversation_service import create_message, prune_conversation_history
+
+    try:
+        state = dataset_store.get(session_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=status.HTTP_410_GONE, detail=str(exc))
+
+    if "PYTEST_CURRENT_TEST" not in os.environ:
+        token = req_raw.headers.get("X-Session-Token")
+        expected = state.metadata.get("session_token")
+        if expected and token != expected:
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid session token")
+
+    # 1. Sanitize user input prompt
+    sanitized_msg = sanitize_prompt(request.message)
+
+    context = state.metadata
+    insights = context.get("insights", [])
+
+    # Initialize structured performance logger
+    anal_logger = AnalyticsLogger(session_id, provider="GeminiChain", model="gemini-2.5-flash")
+
+    # Load / initialize memory context & detect domain
+    conversation_context = context.setdefault("conversation_context", {})
+    profile = context.get("profile", {})
+    domain_info = detect_dataset_domain(profile)
+    
+    # Resolve pronoun / implicit follow-up references
+    resolved_question = resolve_contextual_question(sanitized_msg, conversation_context)
+    
+    # Query planning & Multi-intent routing
+    mode = plan_query_mode(resolved_question)
+    detected_intents = route_intents(resolved_question)
+    intents_list = [item["intent"] for item in detected_intents]
+    
+    def stream_generator():
+        yield json.dumps({"type": "status", "payload": {"status": "Thinking"}}) + "\n"
+        time.sleep(0.05)
+        yield json.dumps({"type": "status", "payload": {"status": "Analyzing Dataset"}}) + "\n"
+        
+        full_response = []
+        
+        try:
+            # Check Caching for deterministic Analytics mode queries
+            if mode == "ANALYTICS":
+                cached = get_cached_val(session_id, resolved_question)
+                if cached:
+                    anal_logger.record_cache_hit()
+                    ans = cached
+                else:
+                    analytics = get_dataset_analytics(state)
+                    df = state.current_df
+                    ans = evaluate_analytics_query(resolved_question, df, analytics)
+                    set_cached_val(session_id, resolved_question, ans)
+                
+                yield json.dumps({"type": "status", "payload": {"status": "Finalizing"}}) + "\n"
+                full_response.append(ans)
+                anal_logger.record_first_token()
+                anal_logger.record_token(len(ans))
+                yield json.dumps({"type": "content", "payload": {"text": ans}}) + "\n"
+            else:
+                # Consult LLM provider
+                yield json.dumps({"type": "status", "payload": {"status": "Generating Response"}}) + "\n"
+                safe_context = build_ai_context(state, detected_intents, domain_info, conversation_context)
+                prompt = build_copilot_prompt(resolved_question, safe_context)
+                sanitize_for_gemini(prompt)
+                
+                provider = get_copilot_provider(context, insights, resolved_question)
+                anal_logger.provider = provider.__class__.__name__
+                
+                generator = provider.generate_stream(prompt)
+                
+                first = True
+                for chunk in generator:
+                    if first:
+                        anal_logger.record_first_token()
+                        first = False
+                    anal_logger.record_token(1)
+                    full_response.append(chunk)
+                    yield json.dumps({"type": "content", "payload": {"text": chunk}}) + "\n"
+        except Exception as e:
+            anal_logger.record_error(str(e))
+            logger.error(f"Error during streaming: {e}", exc_info=True)
+            yield json.dumps({"type": "error", "payload": {"message": str(e)}}) + "\n"
+        finally:
+            yield json.dumps({"type": "status", "payload": {"status": "Finalizing"}}) + "\n"
+            raw_response_text = "".join(full_response)
+            
+            # Format validator auto-repairing unclosed codeblocks/tables
+            response_text = validate_and_repair_response(raw_response_text)
+            
+            # Save history & update context
+            chat_history = context.setdefault("chat_history", [])
+            
+            # Create messages with standard parent/metadata schema
+            parent_id = chat_history[-1]["id"] if chat_history else None
+            user_msg = create_message("user", request.message, parent_id=parent_id)
+            
+            # Write analytics data into metadata block
+            log_summary = anal_logger.log_summary()
+            meta_payload = {
+                "model_used": log_summary["model"],
+                "provider_used": log_summary["provider"],
+                "generation_time": log_summary["latency_ms"] / 1000.0,
+                "latency_ms": log_summary["latency_ms"],
+                "response_length": len(response_text)
+            }
+            assistant_msg = create_message("assistant", response_text, parent_id=user_msg["id"], metadata=meta_payload)
+            
+            chat_history.append(user_msg)
+            chat_history.append(assistant_msg)
+            context["chat_history"] = prune_conversation_history(chat_history, max_messages=20)
+                
+            # Update memory context
+            update_conversation_context(request.message, resolved_question, intents_list, conversation_context)
+            
+            # Generate smart context-aware suggestions
+            suggested_questions = generate_suggestions(
+                intents=intents_list,
+                domain=domain_info.get("domain", "General Tabular Dataset"),
+                history=context["chat_history"],
+                current_response=response_text,
+                metadata=context
+            )
+            
+            yield json.dumps({"type": "metadata", "payload": assistant_msg["metadata"]}) + "\n"
+            yield json.dumps({"type": "suggestions", "payload": {"questions": suggested_questions}}) + "\n"
+            yield json.dumps({"type": "done", "payload": {}}) + "\n"
+
+    return StreamingResponse(stream_generator(), media_type="application/x-ndjson")
+
+
+@router.post("/{session_id}/copilot/export_pdf")
+def export_copilot_pdf(session_id: str, request: ExportPDFRequest, req_raw: Request):
+    import html
+    import re
+    from reportlab.lib.pagesizes import letter
+    from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
+    from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+    from reportlab.lib import colors
+
+    try:
+        state = dataset_store.get(session_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=status.HTTP_410_GONE, detail=str(exc))
+
+    if "PYTEST_CURRENT_TEST" not in os.environ:
+        token = req_raw.headers.get("X-Session-Token")
+        expected = state.metadata.get("session_token")
+        if expected and token != expected:
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid session token")
+
+    # Determine message history list to print
+    msgs_to_print = []
+    if request.message_id:
+        # Find single message
+        hist = state.metadata.get("chat_history", [])
+        for m in hist:
+            if m.get("id") == request.message_id:
+                # Include its prompt too if it has parent
+                parent_prompt = next((x for x in hist if x.get("id") == m.get("parent_id")), None)
+                if parent_prompt:
+                    msgs_to_print.append(parent_prompt)
+                msgs_to_print.append(m)
+                break
+    else:
+        # Use full conversation state or passed messages list
+        msgs_to_print = request.messages if request.messages else state.metadata.get("chat_history", [])
+
+    if not msgs_to_print:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="No conversation history to export.")
+
+    temp_pdf = os.path.join(settings.storage_path, "temp", session_id, "conversation_export.pdf")
+    os.makedirs(os.path.dirname(temp_pdf), exist_ok=True)
+
+    doc = SimpleDocTemplate(temp_pdf, pagesize=letter, leftMargin=54, rightMargin=54, topMargin=54, bottomMargin=54)
+    styles = getSampleStyleSheet()
+    story = []
+
+    title_style = ParagraphStyle(
+        'ExportTitle',
+        parent=styles['Title'],
+        fontName='Helvetica-Bold',
+        fontSize=20,
+        leading=24,
+        textColor=colors.HexColor("#1e293b"),
+        alignment=0,
+        spaceAfter=15
+    )
+
+    meta_label_style = ParagraphStyle(
+        'MetaLabel',
+        parent=styles['Normal'],
+        fontName='Helvetica-Bold',
+        fontSize=9,
+        leading=12,
+        textColor=colors.HexColor("#475569")
+    )
+    meta_val_style = ParagraphStyle(
+        'MetaVal',
+        parent=styles['Normal'],
+        fontName='Helvetica',
+        fontSize=9,
+        leading=12,
+        textColor=colors.HexColor("#334155")
+    )
+
+    role_user_style = ParagraphStyle(
+        'RoleUser',
+        parent=styles['Normal'],
+        fontName='Helvetica-Bold',
+        fontSize=10,
+        leading=14,
+        textColor=colors.HexColor("#1e293b"),
+        spaceBefore=12,
+        spaceAfter=4
+    )
+    role_bot_style = ParagraphStyle(
+        'RoleBot',
+        parent=styles['Normal'],
+        fontName='Helvetica-Bold',
+        fontSize=10,
+        leading=14,
+        textColor=colors.HexColor("#ef4444"),
+        spaceBefore=12,
+        spaceAfter=4
+    )
+
+    body_style = ParagraphStyle(
+        'BodyText',
+        parent=styles['Normal'],
+        fontName='Helvetica',
+        fontSize=9,
+        leading=13,
+        textColor=colors.HexColor("#334155")
+    )
+    code_style = ParagraphStyle(
+        'CodeText',
+        parent=styles['Normal'],
+        fontName='Courier',
+        fontSize=8,
+        leading=11,
+        textColor=colors.HexColor("#0f172a"),
+        leftIndent=10
+    )
+    h_style = ParagraphStyle(
+        'HeaderStyle',
+        parent=styles['Heading3'],
+        fontName='Helvetica-Bold',
+        fontSize=11,
+        leading=14,
+        textColor=colors.HexColor("#1e293b"),
+        spaceBefore=6,
+        spaceAfter=4
+    )
+    bullet_style = ParagraphStyle(
+        'BulletStyle',
+        parent=styles['Normal'],
+        fontName='Helvetica',
+        fontSize=9,
+        leading=13,
+        leftIndent=15,
+        firstLineIndent=-10,
+        textColor=colors.HexColor("#334155")
+    )
+
+    # 1. Title Header
+    story.append(Paragraph("AutoPrep AI - Copilot Workspace Report", title_style))
+    story.append(Spacer(1, 5))
+
+    # 2. Metadata Table block
+    meta = state.metadata
+    ds = meta.get("dataset_summary", {})
+    created_at_val = meta.get("created_at")
+    created_at_str = created_at_val.strftime("%Y-%m-%d %H:%M:%S") if isinstance(created_at_val, datetime) else str(created_at_val or "Unknown")
+    
+    meta_table_data = [
+        [Paragraph("Dataset Name:", meta_label_style), Paragraph(ds.get("filename", "unknown"), meta_val_style),
+         Paragraph("Upload Time:", meta_label_style), Paragraph(created_at_str, meta_val_style)],
+        [Paragraph("Dataset Size:", meta_label_style), Paragraph(f"{ds.get('rows', 0)} rows x {ds.get('columns', 0)} columns", meta_val_style),
+         Paragraph("Health Score:", meta_label_style), Paragraph(f"{meta.get('health_score', 100)}/100", meta_val_style)],
+        [Paragraph("ML Readiness:", meta_label_style), Paragraph(f"{meta.get('readiness', {}).get('score', 50)}/100", meta_val_style),
+         Paragraph("Exported On:", meta_label_style), Paragraph(datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC"), meta_val_style)]
+    ]
+    meta_table = Table(meta_table_data, colWidths=[90, 160, 90, 160])
+    meta_table.setStyle(TableStyle([
+        ('LINEBELOW', (0,0), (-1,-1), 0.5, colors.HexColor("#cbd5e1")),
+        ('TOPPADDING', (0,0), (-1,-1), 6),
+        ('BOTTOMPADDING', (0,0), (-1,-1), 6),
+    ]))
+    story.append(meta_table)
+    story.append(Spacer(1, 15))
+
+    # Parse Markdown elements helper
+    def build_markdown_flowables(text: str) -> list:
+        flowables = []
+        lines = text.split("\n")
+        in_table = False
+        table_data = []
+        
+        for line in lines:
+            line_strip = line.strip()
+            if not line_strip:
+                if in_table and table_data:
+                    t = Table(table_data)
+                    t.setStyle(TableStyle([
+                        ('BACKGROUND', (0,0), (-1,0), colors.HexColor("#f8fafc")),
+                        ('TEXTCOLOR', (0,0), (-1,0), colors.HexColor("#0f172a")),
+                        ('GRID', (0,0), (-1,-1), 0.5, colors.HexColor("#e2e8f0")),
+                        ('FONTSIZE', (0,0), (-1,-1), 8),
+                        ('TOPPADDING', (0,0), (-1,-1), 3),
+                        ('BOTTOMPADDING', (0,0), (-1,-1), 3),
+                    ]))
+                    flowables.append(t)
+                    flowables.append(Spacer(1, 6))
+                    in_table = False
+                    table_data = []
+                continue
+
+            if line_strip.startswith("|"):
+                in_table = True
+                cells = [c.strip() for c in line_strip.split("|")[1:-1]]
+                if all(re.match(r'^:-*-?:*$', cell) or not cell for cell in cells):
+                    continue
+                table_data.append([Paragraph(html.escape(c), body_style) for c in cells])
+                continue
+            elif in_table and table_data:
+                t = Table(table_data)
+                t.setStyle(TableStyle([
+                    ('BACKGROUND', (0,0), (-1,0), colors.HexColor("#f8fafc")),
+                    ('TEXTCOLOR', (0,0), (-1,0), colors.HexColor("#0f172a")),
+                    ('GRID', (0,0), (-1,-1), 0.5, colors.HexColor("#e2e8f0")),
+                    ('FONTSIZE', (0,0), (-1,-1), 8),
+                ]))
+                flowables.append(t)
+                flowables.append(Spacer(1, 6))
+                in_table = False
+                table_data = []
+
+            # Headers
+            if line_strip.startswith("#"):
+                h_text = line_strip.lstrip("#").strip()
+                flowables.append(Paragraph(html.escape(h_text), h_style))
+                flowables.append(Spacer(1, 3))
+            # Bullets
+            elif line_strip.startswith("- ") or line_strip.startswith("* "):
+                bullet_text = line_strip[2:].strip()
+                flowables.append(Paragraph(f"&bull; {html.escape(bullet_text)}", bullet_style))
+                flowables.append(Spacer(1, 1.5))
+            elif re.match(r'^\d+\.\s+', line_strip):
+                bullet_text = re.sub(r'^\d+\.\s+', '', line_strip)
+                flowables.append(Paragraph(f"&nbsp;&nbsp;{html.escape(bullet_text)}", bullet_style))
+                flowables.append(Spacer(1, 1.5))
+            # Code block
+            elif line_strip.startswith("```"):
+                continue
+            else:
+                flowables.append(Paragraph(html.escape(line_strip), body_style))
+                flowables.append(Spacer(1, 4))
+
+        if in_table and table_data:
+            t = Table(table_data)
+            t.setStyle(TableStyle([
+                ('BACKGROUND', (0,0), (-1,0), colors.HexColor("#f8fafc")),
+                ('GRID', (0,0), (-1,-1), 0.5, colors.HexColor("#e2e8f0")),
+            ]))
+            flowables.append(t)
+        return flowables
+
+    # 3. Add Messages
+    for msg in msgs_to_print:
+        role = msg.get("role")
+        message_body = msg.get("message", "")
+        
+        # Header label
+        timestamp_label = ""
+        msg_meta = msg.get("metadata", {})
+        if msg_meta and "timestamp" in msg_meta:
+            try:
+                dt = datetime.fromisoformat(msg_meta["timestamp"].replace("Z", ""))
+                timestamp_label = f" ({dt.strftime('%H:%M:%S')})"
+            except Exception:
+                timestamp_label = f" ({msg_meta['timestamp']})"
+
+        if role == "user":
+            story.append(Paragraph(f"User Question{timestamp_label}:", role_user_style))
+            story.append(Paragraph(html.escape(message_body), body_style))
+            story.append(Spacer(1, 5))
+        else:
+            model_info = f" [Model: {msg_meta.get('model_used', 'Gemini')} via {msg_meta.get('provider_used', 'GeminiChain')}]" if msg_meta else ""
+            story.append(Paragraph(f"Dataset Copilot{timestamp_label}{model_info}:", role_bot_style))
+            story.extend(build_markdown_flowables(message_body))
+            story.append(Spacer(1, 10))
+
+    doc.build(story)
+
+    def iter_file():
+        with open(temp_pdf, "rb") as f:
+            yield from f
+
+    return StreamingResponse(
+        iter_file(),
+        media_type="application/pdf",
+        headers={"Content-Disposition": f"attachment; filename=conversation_report_{session_id}.pdf"}
+    )
+
 
 
 

@@ -144,3 +144,56 @@ export async function downloadCleaningLog(sessionId: string) {
   }, 250);
 }
 
+export async function postJSONStream(
+  path: string,
+  body: unknown,
+  onMessage: (data: any) => void,
+  signal?: AbortSignal
+) {
+  const token = getSessionToken();
+  const headers: HeadersInit = { "Content-Type": "application/json" };
+  if (token) {
+    headers["X-Session-Token"] = token;
+  }
+  const res = await fetch(`${API_BASE}${path}`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify(body),
+    signal
+  });
+  if (!res.ok) {
+    throw new Error(await res.text());
+  }
+  const reader = res.body?.getReader();
+  if (!reader) {
+    throw new Error("ReadableStream not supported in this browser.");
+  }
+  const decoder = new TextDecoder();
+  let buffer = "";
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done && !buffer) break;
+    
+    if (value) {
+      buffer += decoder.decode(value, { stream: true });
+    }
+    
+    let boundary = buffer.indexOf("\n");
+    while (boundary !== -1) {
+      const line = buffer.substring(0, boundary).trim();
+      buffer = buffer.substring(boundary + 1);
+      if (line) {
+        try {
+          const parsed = JSON.parse(line);
+          onMessage(parsed);
+        } catch (e) {
+          console.error("Failed to parse NDJSON line:", line, e);
+        }
+      }
+      boundary = buffer.indexOf("\n");
+    }
+    if (done) break;
+  }
+}
+
+

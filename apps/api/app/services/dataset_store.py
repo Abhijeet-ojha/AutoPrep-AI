@@ -34,6 +34,14 @@ class DatasetState:
         self.metadata = metadata
         self.file_path = file_path
 
+    @property
+    def current_df(self) -> pd.DataFrame:
+        import pandas as pd
+        full_path = os.path.join(settings.storage_path, "temp", self.file_path)
+        if not os.path.exists(full_path):
+            raise FileNotFoundError(f"Cleaned CSV file not found at: {full_path}")
+        return pd.read_csv(full_path)
+
 
 class InMemoryDatasetStore:
     def __init__(self) -> None:

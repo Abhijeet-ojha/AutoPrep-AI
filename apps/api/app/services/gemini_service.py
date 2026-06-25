@@ -15,6 +15,11 @@ class CopilotProvider(ABC):
         """Generate response text based on the constructed prompt."""
         pass
 
+    @abstractmethod
+    def generate_stream(self, prompt: str):
+        """Generate response text stream based on the constructed prompt."""
+        pass
+
 
 class GeminiProvider(CopilotProvider):
     def __init__(self):
@@ -32,6 +37,18 @@ class GeminiProvider(CopilotProvider):
             return response.text
         except Exception as e:
             logger.error(f"Gemini API execution failed: {e}")
+            raise
+
+    def generate_stream(self, prompt: str):
+        logger.info("Sending streaming request to Gemini model 'gemini-2.5-flash'...")
+        try:
+            model = genai.GenerativeModel("gemini-2.5-flash")
+            response = model.generate_content(prompt, stream=True)
+            for chunk in response:
+                if chunk.text:
+                    yield chunk.text
+        except Exception as e:
+            logger.error(f"Gemini API streaming execution failed: {e}")
             raise
 
 
@@ -77,6 +94,51 @@ class GroqProvider(CopilotProvider):
                 return content
         except Exception as e:
             logger.error(f"Groq API execution failed: {e}")
+            raise
+
+    def generate_stream(self, prompt: str):
+        logger.info(f"Sending streaming request to Groq model '{settings.groq_model}'...")
+        headers = {
+            "Authorization": f"Bearer {settings.groq_api_key}",
+            "Content-Type": "application/json"
+        }
+        payload = {
+            "model": settings.groq_model,
+            "messages": [
+                {
+                    "role": "system",
+                    "content": "You are AutoPrep AI Dataset Copilot, an expert data scientist assistant. Provide concise, accurate and professional insights."
+                },
+                {
+                    "role": "user",
+                    "content": prompt
+                }
+            ],
+            "temperature": 0.2,
+            "stream": True
+        }
+        try:
+            import json
+            with httpx.Client(timeout=30.0) as client:
+                with client.stream("POST", "https://api.groq.com/openai/v1/chat/completions", headers=headers, json=payload) as response:
+                    if response.status_code != 200:
+                        raise RuntimeError(f"Groq API returned status {response.status_code}")
+                    for line in response.iter_lines():
+                        if not line.strip():
+                            continue
+                        if line.startswith("data: "):
+                            data_str = line[6:].strip()
+                            if data_str == "[DONE]":
+                                break
+                            try:
+                                chunk_json = json.loads(data_str)
+                                delta = chunk_json["choices"][0]["delta"]
+                                if "content" in delta:
+                                    yield delta["content"]
+                            except Exception:
+                                pass
+        except Exception as e:
+            logger.error(f"Groq API streaming execution failed: {e}")
             raise
 
 
@@ -149,27 +211,89 @@ class FallbackProvider(CopilotProvider):
             return header + resp
             
         else:
-            # General fallback response - aggregates summary, insights, and structured plan
-            explanation = generate_health_explanation(self.context)
-            resp = f"### 📊 Summary:\n{explanation}\n\n"
+            # Full structured report
+            ds = self.context.get("dataset_summary", {})
+            raw_metrics = self.context.get("raw_metrics", {})
+            cleaning_impact = self.context.get("cleaning_impact", {})
+            readiness = self.context.get("readiness", {})
             
-            if self.insights:
-                resp += "### 🔍 Key Quality Insights:\n"
-                for ins in self.insights:
-                    resp += f"- **{ins['title']}**: {ins['evidence']}\n"
-                    resp += f"  *Recommendation:* {ins['recommendation']}\n"
+            resp = "# Dataset Analysis Report\n\n"
+            resp += "Here is the professional structured dataset analysis computed deterministically by AutoPrep AI.\n\n"
+            
+            # 1. Dataset Overview
+            resp += "## Dataset Overview\n"
+            resp += "| Property | Value |\n"
+            resp += "| --- | --- |\n"
+            resp += f"| Filename | {ds.get('filename', 'unknown')} |\n"
+            resp += f"| Row Count | {ds.get('rows', 0)} |\n"
+            resp += f"| Column Count | {ds.get('columns', 0)} |\n"
+            resp += f"| File Size | {ds.get('file_size_bytes', 0)} bytes |\n\n"
+            
+            # 2. Overall Health
+            explanation = generate_health_explanation(self.context)
+            resp += f"## Overall Health\n{explanation}\n\n"
+            
+            # 3. Data Quality Summary
+            missing = raw_metrics.get("original_missing_count", 0)
+            dups = raw_metrics.get("original_duplicate_count", 0)
+            outliers = raw_metrics.get("original_outlier_count", 0)
+            resp += "## Data Quality Summary\n"
+            resp += f"- **Missing Values**: Found **{missing}** missing cells in the raw dataset.\n"
+            resp += f"- **Duplicate Rows**: Identified **{dups}** duplicate rows.\n"
+            resp += f"- **Outliers**: Detected **{outliers}** outlier values across numeric features.\n\n"
+            
+            # 4. Cleaning Impact
+            resp += "## Cleaning Impact\n"
+            resp += "| Metric | Before Auto-Clean | After Auto-Clean |\n"
+            resp += "| --- | --- | --- |\n"
+            resp += f"| Row Count | {cleaning_impact.get('rows_before', ds.get('rows', 0))} | {cleaning_impact.get('rows_after', ds.get('rows', 0))} |\n"
+            resp += f"| Missing Values | {missing} | 0 |\n"
+            resp += f"| Duplicate Rows | {dups} | 0 |\n"
+            resp += f"| Outliers Treated | 0 | {cleaning_impact.get('outliers_treated', 0)} |\n\n"
+            
+            # 5. Dataset Composition
+            resp += "## Dataset Composition\n"
+            profile_summary = self.context.get("profile_summary") or self.context.get("profile", {})
+            if profile_summary:
+                resp += "| Column | Type | Missing% | Unique Values |\n"
+                resp += "| --- | --- | --- | --- |\n"
+                for col, info in profile_summary.items():
+                    resp += f"| {col} | {info.get('type', 'unknown')} | {info.get('missing_pct', 0.0):.1f}% | {info.get('cardinality', 'N/A')} |\n"
                 resp += "\n"
+            else:
+                resp += "Column schema composition metadata is currently unavailable.\n\n"
                 
-            resp += "### 🛠️ Recommended Cleaning Steps:\n"
+            # 6. Machine Learning Readiness
+            resp += "## Machine Learning Readiness\n"
+            resp += f"The dataset has a Machine Learning Readiness score of **{readiness.get('score', 50)}/100**.\n"
+            resp += f"- **Target Task Recommendation**: {readiness.get('target_type', 'General modeling')} ({readiness.get('recommended_task', 'predictive task')}).\n"
+            resp += f"- **Pre-processing Advice**: Features have been imputed, duplicates evicted, and columns semantically annotated.\n\n"
+            
+            # 7. Recommendations
+            resp += "## Recommendations\n"
             plan = get_structured_cleaning_plan(self.context)
             if not plan:
-                resp += "1. No quality actions required. The dataset looks clean!\n"
+                resp += "1. No quality actions required. The dataset is fully cleaned and ready!\n"
             else:
                 for idx, step in enumerate(plan, 1):
                     col_str = f" on column `{step['column']}`" if step['column'] else ""
-                    resp += f"{idx}. Run **{step['action']}**{col_str} (Method: `{step['method']}`).\n"
+                    resp += f"{idx}. **{step['action']}**{col_str} (Method: `{step['method']}`): {step['reason']}\n"
+            resp += "\n"
+            
+            # 8. Final Summary
+            resp += "## Final Summary\n"
+            resp += "The dataset has been successfully cleaned and optimized. It is recommended to download the cleaned CSV and proceed with model training."
             
             return header + resp
+
+    def generate_stream(self, prompt: str):
+        full_text = self.generate(prompt)
+        import time
+        words = full_text.split(" ")
+        for i in range(0, len(words), 3):
+            chunk = " ".join(words[i:i+3]) + " "
+            yield chunk
+            time.sleep(0.03)
 
 
 class MultiProviderChain(CopilotProvider):
@@ -188,6 +312,29 @@ class MultiProviderChain(CopilotProvider):
                 logger.warning(f"LLM Provider {name} failed: {e}. Trying next provider in chain...")
                 last_error = e
         raise RuntimeError(f"All LLM providers in chain failed. Last error: {last_error}")
+
+    def generate_stream(self, prompt: str):
+        last_error = None
+        for name, provider in self.providers:
+            try:
+                iterator = provider.generate_stream(prompt)
+                first_chunk = next(iterator, None)
+            except Exception as e:
+                logger.warning(f"LLM Provider stream {name} failed to initialize: {e}. Trying next provider in chain...")
+                last_error = e
+                continue
+
+            if first_chunk is not None:
+                self.successful_provider = name
+                yield first_chunk
+                try:
+                    for chunk in iterator:
+                        yield chunk
+                except Exception as e:
+                    logger.error(f"LLM Provider {name} failed mid-stream: {e}")
+                    raise
+                return
+        raise RuntimeError(f"All LLM providers in chain failed to stream. Last error: {last_error}")
 
 
 def get_copilot_provider(context: dict, insights: list[dict], question: str | None = None) -> CopilotProvider:

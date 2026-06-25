@@ -30,3 +30,14 @@ yarn-error.log*
 .env.development.local
 .env.test.local
 .env.production.local
+
+# Exclude markdown files
+*.md
+**/*.md
+
+# Exclude scratch files, test PDFs, storage, and local uploads
+**/scratch/
+**/scratch_*
+*.pdf
+**/storage/
+test_upload.csv

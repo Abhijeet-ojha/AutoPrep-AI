@@ -15,3 +15,9 @@ class ChatRequest(BaseModel):
 
 class CopilotRequest(BaseModel):
     message: str
+
+
+class ExportPDFRequest(BaseModel):
+    message_id: str | None = None
+    messages: list[dict] | None = None
+

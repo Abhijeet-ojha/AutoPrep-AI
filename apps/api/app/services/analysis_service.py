@@ -2047,7 +2047,8 @@ def generate_plotly_insights(df: pd.DataFrame, audit: dict[str, Any], profile: d
         "layout": {
             "title": f"Distribution of '{hist_col}'",
             "xaxis": {"title": hist_col, "automargin": True},
-            "yaxis": {"title": "Frequency", "automargin": True}
+            "yaxis": {"title": "Frequency", "automargin": True},
+            "bargap": 0.05
         }
     })
 
