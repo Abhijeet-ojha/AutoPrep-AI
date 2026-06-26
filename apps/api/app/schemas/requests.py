@@ -21,3 +21,7 @@ class ExportPDFRequest(BaseModel):
     message_id: str | None = None
     messages: list[dict] | None = None
 
+
+class DownloadTokenRequest(BaseModel):
+    file_type: str = Field(..., pattern="^(csv|pdf)$")
+

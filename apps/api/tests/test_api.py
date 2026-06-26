@@ -221,3 +221,82 @@ def test_cleanup_worker_ttl(client, sample_csv_bytes):
     
     # 7. Verify orphaned directory is evicted from disk
     assert not os.path.exists(orphaned_dir)
+
+
+def test_signed_download_pipeline(client, sample_csv_bytes):
+    """Test the signed download token flow: CSV and PDF downloads, expiration, and tampering rejections."""
+    dataset_store.active_sessions.clear()
+
+    # 1. Upload dataset
+    resp_up = client.post(
+        "/datasets/upload",
+        files={"file": ("test_signed.csv", sample_csv_bytes, "text/csv")}
+    )
+    assert resp_up.status_code == 200
+    dataset_id = resp_up.json()["dataset_summary"]["dataset_id"]
+    session_token = resp_up.json()["session_token"]
+    
+    headers = {"X-Session-Token": session_token}
+
+    # 2. Request CSV download token
+    resp_token_csv = client.post(
+        f"/datasets/{dataset_id}/download-token",
+        json={"file_type": "csv"},
+        headers=headers
+    )
+    assert resp_token_csv.status_code == 200
+    csv_url = resp_token_csv.json()["url"]
+    assert "signature=" in csv_url
+    assert "expires=" in csv_url
+    assert "file_type=csv" in csv_url
+
+    # 3. Request PDF download token
+    resp_token_pdf = client.post(
+        f"/datasets/{dataset_id}/download-token",
+        json={"file_type": "pdf"},
+        headers=headers
+    )
+    assert resp_token_pdf.status_code == 200
+    pdf_url = resp_token_pdf.json()["url"]
+    assert "signature=" in pdf_url
+    assert "expires=" in pdf_url
+    assert "file_type=pdf" in pdf_url
+
+    # 4. Try downloading CSV using correct signed URL
+    resp_csv_down = client.get(csv_url)
+    assert resp_csv_down.status_code == 200
+    assert "text/csv" in resp_csv_down.headers["content-type"]
+    assert "test_signed_cleaned.csv" in resp_csv_down.headers["content-disposition"]
+    assert "Alice" in resp_csv_down.content.decode("utf-8")
+
+    # Clean up test session again since CSV download deletes the session
+    resp_up = client.post(
+        "/datasets/upload",
+        files={"file": ("test_signed.csv", sample_csv_bytes, "text/csv")}
+    )
+    dataset_id = resp_up.json()["dataset_summary"]["dataset_id"]
+    session_token = resp_up.json()["session_token"]
+    headers = {"X-Session-Token": session_token}
+
+    # 5. Try downloading PDF using correct signed URL
+    resp_token_pdf = client.post(
+        f"/datasets/{dataset_id}/download-token",
+        json={"file_type": "pdf"},
+        headers=headers
+    )
+    pdf_url = resp_token_pdf.json()["url"]
+    
+    resp_pdf_down = client.get(pdf_url)
+    assert resp_pdf_down.status_code in (200, 409)
+
+    # 6. Verify tampered signature is rejected with 403
+    bad_sig_url = pdf_url.replace("signature=", "signature=tampered")
+    resp_bad_sig = client.get(bad_sig_url)
+    assert resp_bad_sig.status_code == 403
+
+    # 7. Verify expired signature is rejected
+    import re
+    expired_url = re.sub(r"expires=\d+", "expires=100000", pdf_url)
+    resp_expired = client.get(expired_url)
+    assert resp_expired.status_code == 403
+

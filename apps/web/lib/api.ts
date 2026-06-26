@@ -51,66 +51,30 @@ export async function postJSON(path: string, body: unknown) {
   return res.json();
 }
 
-export async function downloadCleanedCSV(sessionId: string, filename: string) {
-  const token = getSessionToken();
-  const headers: HeadersInit = {};
-  if (token) {
-    headers["X-Session-Token"] = token;
-  }
-  const res = await fetch(`${API_BASE}/datasets/${sessionId}/download`, { headers });
-  if (!res.ok) {
-    const errText = await res.text();
-    let message = "Failed to download cleaned dataset.";
-    try {
-      const parsed = JSON.parse(errText);
-      if (parsed.detail) message = parsed.detail;
-    } catch {
-      if (errText) message = errText;
-    }
-    throw new Error(message);
-  }
-  const blob = await res.blob();
-  const url = window.URL.createObjectURL(blob);
+export async function getDownloadToken(sessionId: string, fileType: "csv" | "pdf"): Promise<{ url: string }> {
+  return postJSON(`/datasets/${sessionId}/download-token`, { file_type: fileType });
+}
+
+export async function downloadCleanedCSV(sessionId: string, filename?: string) {
+  const { url } = await getDownloadToken(sessionId, "csv");
+  const downloadUrl = `${API_BASE}${url}`;
+  
   const a = document.createElement("a");
-  a.href = url;
-  a.download = `${filename.replace(".csv", "")}_cleaned.csv`;
+  a.href = downloadUrl;
   document.body.appendChild(a);
   a.click();
   a.remove();
-  setTimeout(() => {
-    window.URL.revokeObjectURL(url);
-  }, 250);
 }
 
 export async function downloadReport(sessionId: string) {
-  const token = getSessionToken();
-  const headers: HeadersInit = {};
-  if (token) {
-    headers["X-Session-Token"] = token;
-  }
-  const res = await fetch(`${API_BASE}/datasets/${sessionId}/report`, { headers });
-  if (!res.ok) {
-    const errText = await res.text();
-    let message = "Failed to retrieve cleaning report.";
-    try {
-      const parsed = JSON.parse(errText);
-      if (parsed.detail) message = parsed.detail;
-    } catch {
-      if (errText) message = errText;
-    }
-    throw new Error(message);
-  }
-  const blob = await res.blob();
-  const url = window.URL.createObjectURL(blob);
+  const { url } = await getDownloadToken(sessionId, "pdf");
+  const downloadUrl = `${API_BASE}${url}`;
+  
   const a = document.createElement("a");
-  a.href = url;
-  a.download = `report_${sessionId}.pdf`;
+  a.href = downloadUrl;
   document.body.appendChild(a);
   a.click();
   a.remove();
-  setTimeout(() => {
-    window.URL.revokeObjectURL(url);
-  }, 250);
 }
 
 export async function downloadCleaningLog(sessionId: string) {

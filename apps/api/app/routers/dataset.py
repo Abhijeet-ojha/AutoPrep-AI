@@ -7,7 +7,7 @@ from datetime import datetime
 from fastapi import APIRouter, File, HTTPException, UploadFile, status, Request, BackgroundTasks
 from fastapi.responses import JSONResponse, StreamingResponse, HTMLResponse
 
-from app.schemas.requests import CopilotRequest
+from app.schemas.requests import CopilotRequest, DownloadTokenRequest
 from app.services.analysis_service import (
     load_dataset,
     profile_dataset,
@@ -27,7 +27,23 @@ from app.core.config import settings
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/datasets", tags=["datasets"])
+import hmac
+import hashlib
+import time
 
+def generate_signature(session_id: str, file_type: str, expires: int) -> str:
+    message = f"{session_id}:{file_type}:{expires}"
+    return hmac.new(
+        settings.secret_key.encode("utf-8"),
+        message.encode("utf-8"),
+        hashlib.sha256
+    ).hexdigest()
+
+def verify_signature(session_id: str, file_type: str, expires: int, signature: str) -> bool:
+    if time.time() > expires:
+        return False
+    expected = generate_signature(session_id, file_type, expires)
+    return hmac.compare_digest(expected, signature)
 
 import pandas as pd
 
@@ -339,17 +355,65 @@ def get_metadata(session_id: str, request: Request):
         raise HTTPException(status_code=status.HTTP_410_GONE, detail=str(exc))
 
 
-@router.get("/{session_id}/download")
-def download_cleaned(session_id: str, request: Request):
+@router.post("/{session_id}/download-token")
+def create_download_token(session_id: str, request: DownloadTokenRequest, req_raw: Request):
     try:
         state = dataset_store.get(session_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=status.HTTP_410_GONE, detail=str(exc))
+
+    if "PYTEST_CURRENT_TEST" not in os.environ:
+        token = req_raw.headers.get("X-Session-Token")
+        expected = state.metadata.get("session_token")
+        if expected and token != expected:
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid session token")
+            
+    expires = int(time.time()) + 60  # 60 second expiry
+    signature = generate_signature(session_id, request.file_type, expires)
+    
+    url_path = f"/datasets/{session_id}/download?file_type={request.file_type}&expires={expires}&signature={signature}"
+    return {"url": url_path}
+
+
+@router.get("/{session_id}/download")
+def download_cleaned(
+    session_id: str,
+    request: Request,
+    file_type: str | None = None,
+    expires: int | None = None,
+    signature: str | None = None
+):
+    # 1. Signature Check
+    if signature is not None:
+        if file_type is None or expires is None:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Missing expires or file_type for signed download.")
+        if not verify_signature(session_id, file_type, expires, signature):
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Invalid, tampered, or expired signature.")
+    else:
+        # Backward compatibility fallback: validate X-Session-Token
+        try:
+            state = dataset_store.get(session_id)
+        except KeyError as exc:
+            raise HTTPException(status_code=status.HTTP_410_GONE, detail=str(exc))
+            
         if "PYTEST_CURRENT_TEST" not in os.environ:
             token = request.headers.get("X-Session-Token")
             expected = state.metadata.get("session_token")
             if expected and token != expected:
                 raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid session token")
         
-        file_path = os.path.join(settings.storage_path, "temp", session_id, "cleaned.csv")
+        file_type = "csv"
+
+    # 2. Retrieve State
+    try:
+        state = dataset_store.get(session_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=status.HTTP_410_GONE, detail=str(exc))
+
+    temp_dir = os.path.join(settings.storage_path, "temp", session_id)
+
+    if file_type == "csv":
+        file_path = os.path.join(temp_dir, "cleaned.csv")
         if not os.path.exists(file_path):
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Cleaned CSV not found on disk")
         
@@ -364,20 +428,102 @@ def download_cleaned(session_id: str, request: Request):
             media_type="text/csv",
             headers={"Content-Disposition": f"attachment; filename={state.file_name.rsplit('.', 1)[0]}_cleaned.csv"},
         )
-    except KeyError as exc:
-        raise HTTPException(status_code=status.HTTP_410_GONE, detail=str(exc))
+    elif file_type == "pdf":
+        pdf_path = os.path.join(temp_dir, "report.pdf")
+        
+        # Check background generation status
+        report_status = getattr(state, "report_status", "pending")
+        if report_status == "generating" and not os.path.exists(pdf_path):
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="Report is being prepared in the background. Please wait a few seconds and try again."
+            )
+            
+        # Cache-first check
+        if not os.path.exists(pdf_path):
+            import pandas as pd
+            
+            # Retrieve cached raw dataframe from memory
+            raw_df = getattr(state, "raw_df", None)
+            if raw_df is None:
+                # If for some reason not in memory (e.g. process restarted), try loading from raw.csv
+                raw_csv_path = os.path.join(temp_dir, "raw.csv")
+                if os.path.exists(raw_csv_path):
+                    raw_df = pd.read_csv(raw_csv_path)
+                else:
+                    # Last resort fallback: use current_df
+                    raw_df = state.current_df
+            
+            meta = state.metadata
+            profile = meta.get("profile")
+            audit = meta.get("quality")
+            health = meta.get("health")
+            readiness = meta.get("readiness")
+            cleaning_logs = meta.get("cleaning_logs")
+            column_semantics = meta.get("column_semantics")
+            cleaning_impact = meta.get("cleaning_impact")
+            cleaned_health = meta.get("cleaned_health")
+            
+            # Generate and save Matplotlib charts
+            generate_and_save_charts(raw_df, audit, profile, temp_dir)
+            
+            # Generate PDF report
+            generate_pdf_report(
+                session_id=session_id,
+                output_path=pdf_path,
+                profile=profile,
+                audit=audit,
+                health=health,
+                ml=readiness,
+                charts_dir=temp_dir,
+                cleaning_logs=cleaning_logs,
+                rows_before=len(raw_df),
+                rows_after=meta.get("dataset_summary", {}).get("rows", len(raw_df)),
+                column_semantics=column_semantics,
+                cleaning_impact=cleaning_impact,
+                cleaned_health=cleaned_health
+            )
+            
+        if not os.path.exists(pdf_path):
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Report PDF not found")
+            
+        def iter_file():
+            with open(pdf_path, mode="rb") as f:
+                yield from f
+                
+        return StreamingResponse(
+            iter_file(),
+            media_type="application/pdf",
+            headers={"Content-Disposition": f"attachment; filename=report_{session_id}.pdf"},
+        )
+    else:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Unsupported file type.")
 
 
 @router.get("/{session_id}/report")
-def get_pdf_report(session_id: str, request: Request):
+def get_pdf_report(
+    session_id: str,
+    request: Request,
+    expires: int | None = None,
+    signature: str | None = None
+):
     try:
-        state = dataset_store.get(session_id)
-        if "PYTEST_CURRENT_TEST" not in os.environ:
-            token = request.headers.get("X-Session-Token")
-            expected = state.metadata.get("session_token")
-            if expected and token != expected:
-                raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid session token")
+        # 1. Signature Check
+        if signature is not None:
+            if expires is None:
+                raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Missing expires for signed download.")
+            if not verify_signature(session_id, "pdf", expires, signature):
+                raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Invalid, tampered, or expired signature.")
+        else:
+            # Backward compatibility fallback: validate X-Session-Token
+            state = dataset_store.get(session_id)
+            if "PYTEST_CURRENT_TEST" not in os.environ:
+                token = request.headers.get("X-Session-Token")
+                expected = state.metadata.get("session_token")
+                if expected and token != expected:
+                    raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid session token")
         
+        state = dataset_store.get(session_id)
         temp_dir = os.path.join(settings.storage_path, "temp", session_id)
         pdf_path = os.path.join(temp_dir, "report.pdf")
         

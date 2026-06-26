@@ -22,6 +22,7 @@ AutoPrep AI is a modern, end-to-end data preparation and analysis platform that 
 6. [AI Copilot Architecture](#6-ai-copilot-architecture)
 7. [Hybrid Analytics Engine](#7-hybrid-analytics-engine)
 8. [Performance Optimization Journey](#8-performance-optimization-journey)
+8a. [Secure Download Pipeline](#8a-secure-download-pipeline)
 9. [Performance Benchmarks & Validation](#9-performance-benchmarks--validation)
 10. [Project Structure](#10-project-structure)
 11. [Installation & Setup](#11-installation--setup)
@@ -99,49 +100,51 @@ AutoPrep AI is a modern, end-to-end data preparation and analysis platform that 
 ## 4. System Architecture
 
 ```
-User (Browser)
-    │
-    ▼ (Next.js Frontend / React App)
- ┌──────────────────────────────────────────────┐
- │ • React-Plotly.js Client-Side Visualizations │
- │ • SSE/NDJSON Streaming Chat Client           │
- └──────────────────────┬───────────────────────┘
-                        │
-                        ▼ (HTTP REST / JSON / Streams)
- ┌──────────────────────────────────────────────┐
- │            FastAPI Gateway Backend           │
- ├──────────────────────────────────────────────┤
- │ • Router: Upload / Session Cache / PDF       │
- │ • Analytics Engine / Prompt Orchestrator     │
- └──────────────────────┬───────────────────────┘
-                        │
-                        ▼ (In-Memory Processing)
- ┌──────────────────────────────────────────────┐
- │         Pandas/NumPy Engine Services         │
- ├──────────────────────────────────────────────┤
- │ • Analysis Service: profiling, health score   │
- │ • Clean Service: imputation, datatype parsing│
- └──────────────────────────────────────────────┘
+                       User (Browser)
+                        │           ▲
+       (Request Token)  │           │  (Redirect & Native Stream)
+                        ▼           │
+           ┌───────────────────────────────┐
+           │ Next.js Frontend / React App  │
+           └───────────────┬───────────────┘
+                           │
+                           ▼ (POST /download-token with X-Session-Token)
+           ┌───────────────────────────────┐
+           │    FastAPI Gateway Backend    │
+           ├───────────────────────────────┤
+           │ • HMAC-SHA256 Signatures      │
+           │ • Direct Streaming Endpoints  │
+           └───────────────┬───────────────┘
+                           │
+                           ▼ (On-demand/Lazy Loading)
+           ┌───────────────────────────────┐
+           │ Pandas/NumPy Engine Services  │
+           └───────────────────────────────┘
 ```
 
 ---
 
 ## 5. Data Upload & Cleaning Pipeline
 
+### Upload & Processing Pipeline
 ```
-[CSV Upload] ──► [MIME & Size Validation] ──► [Pandas Load] 
-                                                    │
-   ┌────────────────────────────────────────────────┘
+[CSV Upload] ──► [MIME & Size Validation] ──► [Pandas Load] ──► [Raw Profiling]
+                                                                     │
+   ┌─────────────────────────────────────────────────────────────────┘
    ▼
-[Raw Profiling] ──► [Quality Audit] ──► [Compute Health Score] 
-                                               │
-   ┌───────────────────────────────────────────┘
+[Quality Audit] ──► [Health Score] ──► [Semantic Inference] ──► [Intelligent Cleaning]
+                                                                     │
+   ┌─────────────────────────────────────────────────────────────────┘
    ▼
-[Semantic Inference] ──► [Intelligent Cleaning] 
-                               │
-   ┌───────────────────────────┘
-   ▼
-[Cleaned Profiling] ──► [ML Readiness Setup] ──► [Plotly Insight Specs] ──► [Save Cache]
+[Cleaned Profiling] ──► [ML Readiness] ──► [Plotly Insight Specs] ──► [Start PDF Bg Task]
+```
+
+### Secure Download Pipeline
+```
+[User Click Download] ──► [POST /download-token] ──► [Verify X-Session-Token]
+                                                             │
+                                                             ▼
+[Native Browser Download] ◄── [Direct Stream (GET /download)] ◄── [Issue 60s Signed URL]
 ```
 
 ---
@@ -198,6 +201,29 @@ During the v2 development cycle, we profiled the `/datasets/upload` endpoint and
 4.  **Numeric Fast-Path Checks:**
     *   *Observation:* Columns that were already numeric were repeatedly coerced using `pd.to_numeric()`, leading to massive C-level casting loops.
     *   *Solution:* Checked `pd.api.types.is_numeric_dtype()` first, allowing native numeric types to completely bypass coercion.
+5.  **Asynchronous Background Report Generation:**
+    *   *Observation:* Compiling the report took CPU resources during download clicks, creating a bottleneck.
+    *   *Solution:* Moved PDF/Matplotlib generation to a background task immediately after upload completes, caching the compiled PDF to disk.
+6.  **Secure Signed Browser-Streamed Downloads:**
+    *   *Observation:* The original frontend implementation fetched the entire CSV or PDF into JavaScript memory as a `Blob` before creating a local object URL. For large files, this caused browser lag, high memory consumption, and delays before the download dialog appeared.
+    *   *Solution:* Replaced the fetch-blob flow with a signed URL download token architecture. The frontend requests a short-lived signed URL token and redirects the browser, allowing the browser's native download manager to stream the response directly to disk with zero client-side memory overhead.
+
+---
+
+## 8a. Secure Download Pipeline
+
+### Why Blob-Based Downloads Fail in Production
+Loading files fully into browser memory as binary blobs (`await response.blob()`) is an anti-pattern for large datasets:
+*   **Memory Bloat:** A 100MB dataset consumes hundreds of megabytes of active browser tab memory.
+*   **Perceived Delay:** The user receives no visual feedback while the JavaScript VM fetches the entire file behind the scenes, causing the application to feel unresponsive.
+
+### How Signed URLs Work
+1.  **Request Token:** The frontend makes a secure POST request to `/datasets/{session_id}/download-token` verifying the `X-Session-Token` header.
+2.  **HMAC Signing:** The backend generates a cryptographically signed signature parameters (`file_type`, `expires`, `signature`) using HMAC-SHA256 and the system's `SECRET_KEY`.
+3.  **Short-Lived Expiration:** Signed URLs expire strictly after 60 seconds to prevent unauthorized reuse or link sharing.
+4.  **Native Browser Streaming:** The frontend redirects the browser (`window.location.href`) or triggers an anchor tag redirect to the signed URL. The browser's native download manager takes over, streaming chunks directly to the filesystem.
+
+---
 
 ---
 
@@ -319,12 +345,14 @@ AutoPrep AI/
 
 *   **`POST /datasets/upload`**
     *   Uploads raw files (CSV, XLSX, JSON). Returns full statistical profile, data quality issues, health score, ML readiness rating, and Plotly spec layout.
+*   **`POST /datasets/{session_id}/download-token`**
+    *   Generates a short-lived (60s) secure download token URL for browser-native streaming downloads of either CSV or PDF reports.
+*   **`GET /datasets/{session_id}/download`**
+    *   Streams the cleaned CSV dataset or PDF report directly using signed URL parameters (or falls back to legacy `X-Session-Token` header validation).
 *   **`GET /datasets/{session_id}/report`**
-    *   Compiles static Matplotlib charts and logs, rendering a printable PDF report dynamically.
+    *   Streams the printable PDF report dynamically using signed URL parameters or fallback headers.
 *   **`POST /copilot/chat`**
     *   Streams context-aware answers to user queries regarding the dataset in an SSE NDJSON format. Includes dynamic next-step suggestions.
-*   **`GET /datasets/{session_id}/download`**
-    *   Downloads the cleaned dataset in CSV format.
 
 ---
 
