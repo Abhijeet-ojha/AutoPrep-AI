@@ -39,3 +39,5 @@ yarn-error.log*
 *.pdf
 **/storage/
 test_upload.csv
+docs/
+
