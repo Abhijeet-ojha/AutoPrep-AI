@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import io
+import time
 import os
 import re
 from collections import Counter
@@ -97,12 +98,26 @@ def infer_column_role(col_name: str, series: pd.Series) -> dict[str, Any]:
 def profile_dataset(df: pd.DataFrame) -> dict[str, Any]:
     columns: list[dict[str, Any]] = []
 
+    numerical_cols = []
+    categorical_cols = []
+    date_cols = []
+    boolean_cols = []
+    text_cols = []
+
     for col in df.columns:
         s = df[col]
-        numeric = pd.to_numeric(s, errors="coerce")
-        is_numeric = numeric.notna().sum() > 0 and s.dtype != "bool"
+        
+        # Optimize numeric check: if native numeric dtype, skip pd.to_numeric
+        is_numeric = False
+        if pd.api.types.is_numeric_dtype(s.dtype) and str(s.dtype) not in ("bool", "boolean"):
+            is_numeric = int(s.notna().sum()) > 0
+            numeric = s
+        else:
+            numeric = pd.to_numeric(s, errors="coerce")
+            is_numeric = int(numeric.notna().sum()) > 0 and str(s.dtype) not in ("bool", "boolean")
 
         if is_numeric:
+            numerical_cols.append(col)
             s_num = numeric.dropna()
             mode_vals = s_num.mode()
             columns.append(
@@ -141,13 +156,24 @@ def profile_dataset(df: pd.DataFrame) -> dict[str, Any]:
                     "skewness": None,
                 }
             )
+            
+        # Standard roles classifications (without repeating full scans)
+        if "date" in col.lower() or "time" in col.lower():
+            date_cols.append(col)
+        if str(s.dtype) in ("bool", "boolean"):
+            boolean_cols.append(col)
+        if s.dtype == "object":
+            if s.nunique(dropna=True) <= 50:
+                categorical_cols.append(col)
+            if s.astype(str).str.len().mean() > 35:
+                text_cols.append(col)
 
     roles = {
-        "numerical": [c for c in df.columns if pd.to_numeric(df[c], errors="coerce").notna().sum() > 0 and str(df[c].dtype) not in ("bool", "boolean")],
-        "categorical": [c for c in df.columns if df[c].dtype == "object" and df[c].nunique(dropna=True) <= 50],
-        "date": [c for c in df.columns if "date" in c.lower() or "time" in c.lower()],
-        "boolean": [c for c in df.columns if str(df[c].dtype) in ("bool", "boolean")],
-        "text": [c for c in df.columns if df[c].dtype == "object" and df[c].astype(str).str.len().mean() > 35],
+        "numerical": numerical_cols,
+        "categorical": categorical_cols,
+        "date": date_cols,
+        "boolean": boolean_cols,
+        "text": text_cols,
     }
 
     return {
@@ -167,12 +193,27 @@ def quality_audit(df: pd.DataFrame) -> dict[str, Any]:
 
     duplicate_rows = int(df.duplicated().sum())
 
-    numeric_cols = [c for c in df.columns if pd.to_numeric(df[c], errors="coerce").notna().sum() > 0 and str(df[c].dtype) not in ("bool", "boolean")]
+    numeric_cols = []
+    for c in df.columns:
+        s_col = df[c]
+        if pd.api.types.is_numeric_dtype(s_col.dtype) and str(s_col.dtype) not in ("bool", "boolean"):
+            if int(s_col.notna().sum()) > 0:
+                numeric_cols.append(c)
+        else:
+            coerced = pd.to_numeric(s_col, errors="coerce")
+            if int(coerced.notna().sum()) > 0 and str(s_col.dtype) not in ("bool", "boolean"):
+                numeric_cols.append(c)
+
     iqr_outliers: dict[str, int] = {}
     zscore_outliers: dict[str, int] = {}
 
     for c in numeric_cols:
-        s = pd.to_numeric(df[c], errors="coerce").dropna()
+        s_raw = df[c]
+        if pd.api.types.is_numeric_dtype(s_raw.dtype):
+            s = s_raw.dropna()
+        else:
+            s = pd.to_numeric(s_raw, errors="coerce").dropna()
+            
         if s.empty:
             continue
         q1, q3 = s.quantile(0.25), s.quantile(0.75)
@@ -189,7 +230,11 @@ def quality_audit(df: pd.DataFrame) -> dict[str, Any]:
     invalid_entries: list[dict[str, Any]] = []
     for c in numeric_cols:
         if "age" in c.lower():
-            s = pd.to_numeric(df[c], errors="coerce")
+            s_raw = df[c]
+            if pd.api.types.is_numeric_dtype(s_raw.dtype):
+                s = s_raw
+            else:
+                s = pd.to_numeric(s_raw, errors="coerce")
             count = int((s < 0).sum())
             if count > 0:
                 invalid_entries.append({"column": c, "rule": "age_cannot_be_negative", "count": count})
@@ -553,12 +598,12 @@ def apply_cleaning_actions(df: pd.DataFrame, actions: list[str]) -> tuple[pd.Dat
     return cleaned, log
 
 
-def feature_engineering_suggestions(df: pd.DataFrame) -> list[dict[str, Any]]:
+def feature_engineering_suggestions(df: pd.DataFrame, column_semantics: dict[str, dict[str, Any]] | None = None) -> list[dict[str, Any]]:
     suggestions = []
 
     for c in df.columns:
         s = df[c]
-        sem = infer_semantic_type(c, s)
+        sem = column_semantics.get(c) if column_semantics else infer_semantic_type(c, s)
         sem_type = sem["type"]
         
         if s.nunique(dropna=True) <= 1:
@@ -571,9 +616,9 @@ def feature_engineering_suggestions(df: pd.DataFrame) -> list[dict[str, Any]]:
         elif sem_type == "DateTime":
             suggestions.append(
                 {
-                    "type": "create_feature",
-                    "column": c,
-                    "reason": "Extract year/month/day/weekday from temporal fields for stronger signals.",
+                     "type": "create_feature",
+                     "column": c,
+                     "reason": "Extract year/month/day/weekday from temporal fields for stronger signals.",
                 }
             )
             
@@ -598,7 +643,12 @@ def feature_engineering_suggestions(df: pd.DataFrame) -> list[dict[str, Any]]:
     return suggestions
 
 
-def ml_readiness(df: pd.DataFrame, audit: dict[str, Any], suggestions: list[dict[str, Any]]) -> dict[str, Any]:
+def ml_readiness(
+    df: pd.DataFrame,
+    audit: dict[str, Any],
+    suggestions: list[dict[str, Any]],
+    column_semantics: dict[str, dict[str, Any]] | None = None
+) -> dict[str, Any]:
     quality_penalty = min(40, sum(audit["missing"]["by_column"].values()) / max(len(df), 1))
     target_exists = any(any(k in c.lower() for k in ["target", "label", "class", "y"]) for c in df.columns)
     target_score = 25 if target_exists else 10
@@ -606,9 +656,23 @@ def ml_readiness(df: pd.DataFrame, audit: dict[str, Any], suggestions: list[dict
 
     score = int(max(0, min(100, target_score + feature_score + int(40 - quality_penalty))))
 
+    if column_semantics:
+        has_regression = False
+        for c in df.columns:
+            sem = column_semantics.get(c, {})
+            sem_type = sem.get("type")
+            if sem_type in ("Continuous Numeric", "Discrete Numeric"):
+                missing_count = audit.get("missing", {}).get("by_column", {}).get(c, 0)
+                non_null_count = len(df) - missing_count
+                if non_null_count > len(df) * 0.8:
+                    has_regression = True
+                    break
+    else:
+        has_regression = any(pd.to_numeric(df[c], errors="coerce").notna().sum() > len(df) * 0.8 and str(df[c].dtype) not in ("bool", "boolean") for c in df.columns)
+
     readiness = {
         "classification": target_exists,
-        "regression": any(pd.to_numeric(df[c], errors="coerce").notna().sum() > len(df) * 0.8 and str(df[c].dtype) not in ("bool", "boolean") for c in df.columns),
+        "regression": has_regression,
         "time_series": any("date" in c.lower() or "time" in c.lower() for c in df.columns),
     }
 
@@ -1096,28 +1160,38 @@ def infer_semantic_type(col_name: str, series: pd.Series) -> dict[str, Any]:
     # Additional Fix 1: Pre-classification Numeric Coercion Check
     is_coerced_numeric = False
     if series_clean.dtype == "object" or str(series_clean.dtype) == "string":
-        # Clean currency symbols, commas, percentage signs, and whitespace
-        cleaned_series = (
-            series_clean.astype(str)
+        # Fast sample-based check to avoid running string replacement on thousands of non-numeric cells
+        sample_head = series_clean.head(100)
+        sample_clean = (
+            sample_head.astype(str)
             .str.replace(",", "", regex=False)
             .str.replace("$", "", regex=False)
             .str.replace("%", "", regex=False)
             .str.strip()
         )
-        try:
-            # Check numeric conversion
-            coerced = pd.to_numeric(cleaned_series, errors="coerce")
-            valid_count = int(coerced.notna().sum())
-            total_clean = len(series_clean)
-            if total_clean > 0 and (valid_count / total_clean) > 0.80:
-                is_coerced_numeric = True
-                series_clean = coerced.dropna()
-                # Update variables used for classification
-                unique_count = int(series_clean.nunique())
-                unique_ratio = float(unique_count / total_rows)
-                unique_ratio_clean = float(unique_count / len(series_clean)) if len(series_clean) > 0 else 0.0
-        except Exception:
-            pass
+        sample_coerced = pd.to_numeric(sample_clean, errors="coerce")
+        if len(sample_head) > 0 and (sample_coerced.notna().sum() / len(sample_head)) >= 0.50:
+            cleaned_series = (
+                series_clean.astype(str)
+                .str.replace(",", "", regex=False)
+                .str.replace("$", "", regex=False)
+                .str.replace("%", "", regex=False)
+                .str.strip()
+            )
+            try:
+                # Check numeric conversion
+                coerced = pd.to_numeric(cleaned_series, errors="coerce")
+                valid_count = int(coerced.notna().sum())
+                total_clean = len(series_clean)
+                if total_clean > 0 and (valid_count / total_clean) > 0.80:
+                    is_coerced_numeric = True
+                    series_clean = coerced.dropna()
+                    # Update variables used for classification
+                    unique_count = int(series_clean.nunique())
+                    unique_ratio = float(unique_count / total_rows)
+                    unique_ratio_clean = float(unique_count / len(series_clean)) if len(series_clean) > 0 else 0.0
+            except Exception:
+                pass
 
     # Check mixed types (only if not coerced to numeric)
     is_mixed = False
@@ -1125,11 +1199,13 @@ def infer_semantic_type(col_name: str, series: pd.Series) -> dict[str, Any]:
     has_num = False
     has_bool = False
     if not is_coerced_numeric:
-        type_counts = series_clean.apply(lambda x: type(x).__name__).value_counts()
-        is_mixed = len(type_counts) > 1
-        has_text = any(t in type_counts for t in ("str", "object"))
-        has_num = any(t in type_counts for t in ("int", "float", "int64", "float64"))
-        has_bool = any(t in type_counts for t in ("bool", "bool_"))
+        inferred = pd.api.types.infer_dtype(series_clean, skipna=True)
+        if inferred.startswith("mixed"):
+            type_counts = series_clean.apply(lambda x: type(x).__name__).value_counts()
+            is_mixed = True
+            has_text = any(t in type_counts for t in ("str", "object"))
+            has_num = any(t in type_counts for t in ("int", "float", "int64", "float64"))
+            has_bool = any(t in type_counts for t in ("bool", "bool_"))
     
     res = None
     
@@ -1153,19 +1229,41 @@ def infer_semantic_type(col_name: str, series: pd.Series) -> dict[str, Any]:
         }
     elif not res and (series_clean.dtype == "object" or str(series_clean.dtype) == "string"):
         # Check that it's not purely numeric strings to avoid converting numbers
-        is_pure_numeric = series_clean.astype(str).str.match(r'^-?\d+(\.\d+)?$').all()
+        # Optimized with a fast sample check first
+        sample_pure_num = series_clean.head(100).astype(str).str.match(r'^-?\d+(\.\d+)?$').all()
+        is_pure_numeric = False
+        if sample_pure_num:
+            is_pure_numeric = series_clean.astype(str).str.match(r'^-?\d+(\.\d+)?$').all()
+            
         if not is_pure_numeric:
-            try:
-                parsed = pd.to_datetime(series_clean, errors="coerce")
-                success_ratio = float(parsed.notna().sum() / len(series_clean))
-                if success_ratio > 0.8:
-                    res = {
-                        "type": "DateTime",
-                        "confidence": 0.95,
-                        "reason": f"Successfully parsed as DateTime with {success_ratio*100:.1f}% valid timestamps."
-                    }
-            except Exception:
-                pass
+            is_date_like = False
+            # Check temporal keywords in column name
+            date_keywords = {"date", "time", "year", "joined", "dob", "created", "updated", "month", "day", "hour"}
+            if any(k in name_lower for k in date_keywords):
+                is_date_like = True
+            else:
+                # Fast sample-based dates pattern check
+                sample_dt = series_clean.head(100).astype(str)
+                date_patterns = [
+                    r'^\s*\d{4}[-/]\d{2}[-/]\d{2}',            # ISO Date: YYYY-MM-DD
+                    r'^\s*\d{1,2}[-/]\d{1,2}[-/]\d{2,4}',      # US/UK Date: MM/DD/YYYY or DD/MM/YYYY
+                    r'^\s*[A-Za-z]{3,9}\s+\d{1,2},\s+\d{4}',    # Named Month Day Year: Jul 1, 2018
+                    r'^\s*\d{1,2}\s+[A-Za-z]{3,9}\s+\d{4}',    # Day Named Month Year: 1 Jul 2018
+                ]
+                is_date_like = any(sample_dt.str.match(pat, na=False).any() for pat in date_patterns)
+
+            if is_date_like:
+                try:
+                    parsed = pd.to_datetime(series_clean, errors="coerce")
+                    success_ratio = float(parsed.notna().sum() / len(series_clean))
+                    if success_ratio > 0.8:
+                        res = {
+                            "type": "DateTime",
+                            "confidence": 0.95,
+                            "reason": f"Successfully parsed as DateTime with {success_ratio*100:.1f}% valid timestamps."
+                        }
+                except Exception:
+                    pass
 
     # 3. Boolean Check
     if not res:
@@ -1305,7 +1403,11 @@ def standardize_boolean_series(series: pd.Series) -> pd.Series:
     return series.apply(map_val)
 
 
-def auto_clean_dataset(df: pd.DataFrame) -> tuple[pd.DataFrame, list[dict[str, Any]], dict[str, Any], dict[str, Any], list[dict[str, Any]]]:
+def auto_clean_dataset(
+    df: pd.DataFrame,
+    column_semantics: dict[str, dict[str, Any]] | None = None,
+    audit: dict[str, Any] | None = None
+) -> tuple[pd.DataFrame, list[dict[str, Any]], dict[str, Any], dict[str, Any], list[dict[str, Any]]]:
     """
     Automatically clean the dataset based on semantic rules.
     Returns cleaned DataFrame, cleaning logs, impact statistics, column semantics, and column impacts.
@@ -1314,7 +1416,9 @@ def auto_clean_dataset(df: pd.DataFrame) -> tuple[pd.DataFrame, list[dict[str, A
     cleaned = df.copy()
     logs = []
     
-    column_semantics = {}
+
+    
+    column_semantics_out = {}
     column_impacts = []
     
     # Impact tracking metrics
@@ -1329,17 +1433,30 @@ def auto_clean_dataset(df: pd.DataFrame) -> tuple[pd.DataFrame, list[dict[str, A
     original_duplicate_count = int(df.duplicated().sum())
     original_outlier_count = 0
     # Count original outliers using same rules as before cleaning
-    for col in df.columns:
-        s = df[col]
-        sem_res = infer_semantic_type(col, s)
-        sem_type = sem_res["type"]
-        if sem_type in ("Continuous Numeric", "Discrete Numeric"):
-            s_num = pd.to_numeric(s, errors="coerce").dropna()
-            if len(s_num) > 2:
-                q1, q3 = s_num.quantile(0.25), s_num.quantile(0.75)
-                iqr = q3 - q1
-                if iqr > 0:
-                    original_outlier_count += int(((s_num < (q1 - 1.5 * iqr)) | (s_num > (q3 + 1.5 * iqr))).sum())
+    if audit is not None:
+        if column_semantics is not None:
+            original_outlier_count = 0
+            for col, count in audit.get("outliers", {}).get("iqr", {}).items():
+                sem_res = column_semantics.get(col)
+                if sem_res and sem_res.get("type") in ("Continuous Numeric", "Discrete Numeric"):
+                    original_outlier_count += count
+        else:
+            original_outlier_count = int(sum(audit.get("outliers", {}).get("iqr", {}).values()))
+    else:
+        for col in df.columns:
+            s = df[col]
+            sem_res = column_semantics.get(col) if column_semantics else infer_semantic_type(col, s)
+            sem_type = sem_res["type"]
+            if sem_type in ("Continuous Numeric", "Discrete Numeric"):
+                if pd.api.types.is_numeric_dtype(s.dtype):
+                    s_num = s.dropna()
+                else:
+                    s_num = pd.to_numeric(s, errors="coerce").dropna()
+                if len(s_num) > 2:
+                    q1, q3 = s_num.quantile(0.25), s_num.quantile(0.75)
+                    iqr = q3 - q1
+                    if iqr > 0:
+                        original_outlier_count += int(((s_num < (q1 - 1.5 * iqr)) | (s_num > (q3 + 1.5 * iqr))).sum())
 
     # 1. Duplicates
     dup_count = int(cleaned.duplicated().sum())
@@ -1358,13 +1475,12 @@ def auto_clean_dataset(df: pd.DataFrame) -> tuple[pd.DataFrame, list[dict[str, A
             "affected_rows": dup_count,
             "affected_cells": dup_count * len(df.columns)
         })
-
     # Columns loop
     for col in df.columns:
         s = cleaned[col]
         
         # Infer semantic type
-        sem_res = infer_semantic_type(col, s)
+        sem_res = column_semantics.get(col) if column_semantics else infer_semantic_type(col, s)
         sem_type = sem_res["type"]
 
         # Numeric Coercion Check: if it was inferred as numeric but stored as object/string
@@ -1397,7 +1513,10 @@ def auto_clean_dataset(df: pd.DataFrame) -> tuple[pd.DataFrame, list[dict[str, A
         null_count_before = int(s.isna().sum())
         outlier_count_before = 0
         if sem_type in ("Continuous Numeric", "Discrete Numeric"):
-            s_num = pd.to_numeric(s, errors="coerce").dropna()
+            if pd.api.types.is_numeric_dtype(s.dtype):
+                s_num = s.dropna()
+            else:
+                s_num = pd.to_numeric(s, errors="coerce").dropna()
             if len(s_num) > 2:
                 q1, q3 = s_num.quantile(0.25), s_num.quantile(0.75)
                 iqr = q3 - q1
@@ -1482,7 +1601,10 @@ def auto_clean_dataset(df: pd.DataFrame) -> tuple[pd.DataFrame, list[dict[str, A
             null_count = int(s.isna().sum())
             if null_count > 0:
                 if sem_type == "Continuous Numeric":
-                    numeric_series = pd.to_numeric(s, errors="coerce")
+                    if pd.api.types.is_numeric_dtype(s.dtype):
+                        numeric_series = s
+                    else:
+                        numeric_series = pd.to_numeric(s, errors="coerce")
                     s_num = numeric_series.dropna()
                     skewness = float(s_num.skew()) if len(s_num) > 1 else 0.0
                     
@@ -1520,7 +1642,10 @@ def auto_clean_dataset(df: pd.DataFrame) -> tuple[pd.DataFrame, list[dict[str, A
                     applied_reasons.append(reason_short)
 
                 elif sem_type == "Discrete Numeric":
-                    numeric_series = pd.to_numeric(s, errors="coerce")
+                    if pd.api.types.is_numeric_dtype(s.dtype):
+                        numeric_series = s
+                    else:
+                        numeric_series = pd.to_numeric(s, errors="coerce")
                     s_num = numeric_series.dropna()
                     val = int(round(s_num.median())) if not s_num.empty else 0
                     cleaned[col] = numeric_series.fillna(val)
@@ -1700,7 +1825,10 @@ def auto_clean_dataset(df: pd.DataFrame) -> tuple[pd.DataFrame, list[dict[str, A
 
             # 4. Outliers
             if sem_type in ("Continuous Numeric", "Discrete Numeric"):
-                s_num = pd.to_numeric(s, errors="coerce")
+                if pd.api.types.is_numeric_dtype(s.dtype):
+                    s_num = s
+                else:
+                    s_num = pd.to_numeric(s, errors="coerce")
                 s_clean = s_num.dropna()
                 if len(s_clean) > 2:
                     skewness = float(s_clean.skew()) if len(s_clean) > 1 else 0.0
@@ -1792,7 +1920,10 @@ def auto_clean_dataset(df: pd.DataFrame) -> tuple[pd.DataFrame, list[dict[str, A
             # 5. Dtype Preservation
             if sem_type == "Discrete Numeric":
                 try:
-                    cleaned[col] = pd.to_numeric(cleaned[col], errors="coerce").round().astype("Int64")
+                    if pd.api.types.is_numeric_dtype(cleaned[col].dtype):
+                        cleaned[col] = cleaned[col].round().astype("Int64")
+                    else:
+                        cleaned[col] = pd.to_numeric(cleaned[col], errors="coerce").round().astype("Int64")
                 except Exception:
                     pass
             elif sem_type == "Boolean":
@@ -1809,7 +1940,7 @@ def auto_clean_dataset(df: pd.DataFrame) -> tuple[pd.DataFrame, list[dict[str, A
             col_strategy = " + ".join(applied_actions)
             col_reason = "; ".join(applied_reasons)
 
-        column_semantics[col] = {
+        column_semantics_out[col] = {
             "type": sem_type,
             "confidence": sem_res["confidence"],
             "strategy": col_strategy,
@@ -1827,7 +1958,10 @@ def auto_clean_dataset(df: pd.DataFrame) -> tuple[pd.DataFrame, list[dict[str, A
         null_count_after = int(s_after.isna().sum())
         outlier_count_after = 0
         if sem_type in ("Continuous Numeric", "Discrete Numeric"):
-            s_num = pd.to_numeric(s_after, errors="coerce").dropna()
+            if pd.api.types.is_numeric_dtype(s_after.dtype):
+                s_num = s_after.dropna()
+            else:
+                s_num = pd.to_numeric(s_after, errors="coerce").dropna()
             if len(s_num) > 2:
                 q1, q3 = s_num.quantile(0.25), s_num.quantile(0.75)
                 iqr = q3 - q1
@@ -1855,7 +1989,7 @@ def auto_clean_dataset(df: pd.DataFrame) -> tuple[pd.DataFrame, list[dict[str, A
         "original_outlier_count": original_outlier_count
     }
 
-    return cleaned, logs, cleaning_impact, column_semantics, column_impacts
+    return cleaned, logs, cleaning_impact, column_semantics_out, column_impacts
 
 def _safe_numeric_coercion(series: pd.Series) -> pd.Series:
     """Helper to convert potentially messy string/object numeric series to clean numeric series."""

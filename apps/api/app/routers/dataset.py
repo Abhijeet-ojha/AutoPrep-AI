@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import time
 import logging
 from datetime import datetime
 from fastapi import APIRouter, File, HTTPException, UploadFile, status, Request
@@ -19,6 +20,7 @@ from app.services.analysis_service import (
     flatten_audit,
     ml_readiness,
     feature_engineering_suggestions,
+    infer_semantic_type,
 )
 from app.services.dataset_store import dataset_store
 from app.core.config import settings
@@ -32,9 +34,12 @@ async def upload_dataset(
     request: Request,
     file: UploadFile = File(...)
 ):
+    t_start = time.perf_counter()
+
     from app.services.rate_limit_service import is_rate_limited, track_upload_attempt
 
-    # 1. Rate Limiting Check
+    # 1. Rate Limiting Check & 2. File Validation
+    t0 = time.perf_counter()
     client_ip = request.client.host if request.client else "unknown"
     if is_rate_limited(client_ip, limit=20, window=3600):
         logger.warning(f"Upload rate limit exceeded for client: {client_ip}")
@@ -44,7 +49,6 @@ async def upload_dataset(
         )
     track_upload_attempt(client_ip)
 
-    # 2. File Validation
     filename = file.filename or ""
     extension = "." + filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
     from app.middleware.security import ALLOWED_EXTENSIONS
@@ -77,36 +81,59 @@ async def upload_dataset(
             status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
             detail=f"File too large. Maximum size: {settings.max_upload_size_mb}MB"
         )
+    t_val = time.perf_counter() - t0
 
-    # Load dataset & check for corruption
+    # 3. Dataset Loading
+    t0 = time.perf_counter()
     try:
         df = load_dataset(filename, data)
     except Exception as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid or corrupted file content.") from exc
+    t_load = time.perf_counter() - t0
 
     # Ingest, Auto-clean, and Profile
     try:
-        # Profile RAW Dataset
+        # 4. Raw profiling
+        t0 = time.perf_counter()
         profile = profile_dataset(df)
+        t_raw_prof = time.perf_counter() - t0
+
+        # 5. Quality Audit
+        t0 = time.perf_counter()
         audit = quality_audit(df)
+        t_audit = time.perf_counter() - t0
+
+        # 6. Health score computation
+        t0 = time.perf_counter()
         health = dataset_health_score(audit, profile, len(df))
+        t_health = time.perf_counter() - t0
 
-        # Perform Auto-Cleaning to get cleaned dataset, logs, and impact tracking
-        cleaned_df, cleaning_logs, cleaning_impact, column_semantics, column_impacts = auto_clean_dataset(df)
+        # 7. Intelligent cleaning
+        t0 = time.perf_counter()
+        raw_semantics = {col: infer_semantic_type(col, df[col]) for col in df.columns}
+        cleaned_df, cleaning_logs, cleaning_impact, column_semantics, column_impacts = auto_clean_dataset(df, column_semantics=raw_semantics, audit=audit)
+        t_clean = time.perf_counter() - t0
 
-        # Profile CLEANED Dataset
+        # 8. Cleaned dataset profiling
+        t0 = time.perf_counter()
         cleaned_profile = profile_dataset(cleaned_df)
         cleaned_audit = quality_audit(cleaned_df)
         cleaned_health = dataset_health_score(cleaned_audit, cleaned_profile, len(cleaned_df))
+        t_clean_prof = time.perf_counter() - t0
         
-        # Re-map ML readiness check
-        fe_suggestions = feature_engineering_suggestions(cleaned_df)
-        readiness = ml_readiness(cleaned_df, cleaned_audit, fe_suggestions)
+        # 9. ML readiness computation
+        t0 = time.perf_counter()
+        fe_suggestions = feature_engineering_suggestions(cleaned_df, column_semantics=raw_semantics)
+        readiness = ml_readiness(cleaned_df, cleaned_audit, fe_suggestions, column_semantics=raw_semantics)
+        t_readiness = time.perf_counter() - t0
         
-        # Generate Plotly JSON insights from RAW dataset
+        # 10. Plotly visualization generation
+        t0 = time.perf_counter()
         visuals = generate_plotly_insights(df, audit, profile)
+        t_plotly = time.perf_counter() - t0
         
-        # Rule-based Insights (generate insights using rules in insight_engine)
+        # 11. Insight generation
+        t0 = time.perf_counter()
         context_data = {
             "dataset_summary": {
                 "filename": filename,
@@ -120,6 +147,7 @@ async def upload_dataset(
         from app.services.insight_engine import generate_insights, generate_health_explanation
         insights = generate_insights(context_data, db=None)
         health_explanation = generate_health_explanation(context_data)
+        t_insights = time.perf_counter() - t0
         
         import secrets
         session_token = secrets.token_hex(16)
@@ -155,8 +183,11 @@ async def upload_dataset(
             "chat_history": []
         }
         
-        # Save state in-memory and write temporary CSV file
+        # 12. Session creation (Dataset Store)
+        t0 = time.perf_counter()
         state = dataset_store.create(filename, file_size, cleaned_df, full_metadata)
+        state.raw_df = df # Cache raw dataframe in memory for lazy report generation
+        t_session = time.perf_counter() - t0
         
         # Store dataset_id back inside metadata summary
         full_metadata["dataset_summary"]["dataset_id"] = state.dataset_id
@@ -165,34 +196,59 @@ async def upload_dataset(
         temp_dir = os.path.join(settings.storage_path, "temp", state.dataset_id)
         os.makedirs(temp_dir, exist_ok=True)
         
-        # Save Matplotlib static charts (from RAW dataset) strictly for PDF generation
-        generate_and_save_charts(df, audit, profile, temp_dir)
+        # Save raw dataset to disk for lazy report backup
+        raw_csv_path = os.path.join(temp_dir, "raw.csv")
+        df.to_csv(raw_csv_path, index=False)
+        
+        t_charts_io = 0.0
         
         # Flattened issues (based on RAW dataset audit and length)
         full_metadata["issues"] = flatten_audit(audit, profile, len(df))
         
-        # Save cleaning logs
+        # 14. Save cleaning logs
+        t0 = time.perf_counter()
         import json
         with open(os.path.join(temp_dir, "cleaning_log.json"), "w") as f:
             json.dump(cleaning_logs, f, indent=2)
+        t_logs_io = time.perf_counter() - t0
             
-        # PDF Report
-        pdf_path = os.path.join(temp_dir, "report.pdf")
-        generate_pdf_report(
-            session_id=state.dataset_id,
-            output_path=pdf_path,
-            profile=profile,
-            audit=audit,
-            health=health,
-            ml=readiness,
-            charts_dir=temp_dir,
-            cleaning_logs=cleaning_logs,
-            rows_before=len(df),
-            rows_after=len(cleaned_df),
-            column_semantics=column_semantics,
-            cleaning_impact=cleaning_impact,
-            cleaned_health=cleaned_health
-        )
+        t_pdf_io = 0.0
+
+        t_total = time.perf_counter() - t_start
+
+        timings = [
+            ("File Validation", t_val),
+            ("Load Dataset", t_load),
+            ("Raw Profiling", t_raw_prof),
+            ("Quality Audit", t_audit),
+            ("Health Score Comp", t_health),
+            ("Intelligent Cleaning", t_clean),
+            ("Cleaned Dataset Profiling", t_clean_prof),
+            ("ML Readiness Comp", t_readiness),
+            ("Plotly Visualization Gen", t_plotly),
+            ("Insight Gen", t_insights),
+            ("Session Creation", t_session),
+            ("Matplotlib Chart Gen & Save", t_charts_io),
+            ("Cleaning Log Gen & Save", t_logs_io),
+            ("PDF Report Gen & Save", t_pdf_io),
+        ]
+        total_tracked = sum(t for _, t in timings)
+        table_lines = []
+        table_lines.append("\n=======================================================")
+        table_lines.append("                UPLOAD PIPELINE PROFILING              ")
+        table_lines.append("=======================================================")
+        table_lines.append(f"{'Stage':<30} | {'Time (s)':<10} | {'% of Total':<10}")
+        table_lines.append("-------------------------------------------------------")
+        for stage, t in timings:
+            pct = (t / t_total) * 100 if t_total > 0 else 0
+            table_lines.append(f"{stage:<30} | {t:<10.4f} | {pct:<10.1f}%")
+        table_lines.append("-------------------------------------------------------")
+        table_lines.append(f"{'Total (Tracked)':<30} | {total_tracked:<10.4f} | { (total_tracked / t_total) * 100:<10.1f}%")
+        table_lines.append(f"{'Total (Request)':<30} | {t_total:<10.4f} | {'100.0%':<10}")
+        table_lines.append("=======================================================")
+        
+        logger.info("\n".join(table_lines))
+        print("\n".join(table_lines))
         
         return full_metadata
         
@@ -257,7 +313,54 @@ def get_pdf_report(session_id: str, request: Request):
             if expected and token != expected:
                 raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid session token")
         
-        pdf_path = os.path.join(settings.storage_path, "temp", session_id, "report.pdf")
+        temp_dir = os.path.join(settings.storage_path, "temp", session_id)
+        pdf_path = os.path.join(temp_dir, "report.pdf")
+        
+        # Cache-first check
+        if not os.path.exists(pdf_path):
+            import pandas as pd
+            
+            # Retrieve cached raw dataframe from memory
+            raw_df = getattr(state, "raw_df", None)
+            if raw_df is None:
+                # If for some reason not in memory (e.g. process restarted), try loading from raw.csv
+                raw_csv_path = os.path.join(temp_dir, "raw.csv")
+                if os.path.exists(raw_csv_path):
+                    raw_df = pd.read_csv(raw_csv_path)
+                else:
+                    # Last resort fallback: use current_df
+                    raw_df = state.current_df
+            
+            meta = state.metadata
+            profile = meta.get("profile")
+            audit = meta.get("quality")
+            health = meta.get("health")
+            readiness = meta.get("readiness")
+            cleaning_logs = meta.get("cleaning_logs")
+            column_semantics = meta.get("column_semantics")
+            cleaning_impact = meta.get("cleaning_impact")
+            cleaned_health = meta.get("cleaned_health")
+            
+            # Generate and save Matplotlib charts
+            generate_and_save_charts(raw_df, audit, profile, temp_dir)
+            
+            # Generate PDF report
+            generate_pdf_report(
+                session_id=session_id,
+                output_path=pdf_path,
+                profile=profile,
+                audit=audit,
+                health=health,
+                ml=readiness,
+                charts_dir=temp_dir,
+                cleaning_logs=cleaning_logs,
+                rows_before=len(raw_df),
+                rows_after=meta.get("dataset_summary", {}).get("rows", len(raw_df)),
+                column_semantics=column_semantics,
+                cleaning_impact=cleaning_impact,
+                cleaned_health=cleaned_health
+            )
+            
         if not os.path.exists(pdf_path):
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Report PDF not found")
             
