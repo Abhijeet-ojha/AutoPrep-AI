@@ -4,7 +4,7 @@ import os
 import time
 import logging
 from datetime import datetime
-from fastapi import APIRouter, File, HTTPException, UploadFile, status, Request
+from fastapi import APIRouter, File, HTTPException, UploadFile, status, Request, BackgroundTasks
 from fastapi.responses import JSONResponse, StreamingResponse, HTMLResponse
 
 from app.schemas.requests import CopilotRequest
@@ -29,9 +29,67 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/datasets", tags=["datasets"])
 
 
+import pandas as pd
+
+def generate_report_background(session_id: str, temp_dir: str, raw_df: pd.DataFrame, meta: dict):
+    try:
+        state = dataset_store.active_sessions.get(session_id)
+        if state is None:
+            logger.warning(f"Background task: Session {session_id} not found in store.")
+            return
+            
+        state.report_status = "generating"
+        
+        pdf_path = os.path.join(temp_dir, "report.pdf")
+        if os.path.exists(pdf_path):
+            state.report_status = "ready"
+            return
+            
+        profile = meta.get("profile")
+        audit = meta.get("quality")
+        health = meta.get("health")
+        readiness = meta.get("readiness")
+        cleaning_logs = meta.get("cleaning_logs")
+        column_semantics = meta.get("column_semantics")
+        cleaning_impact = meta.get("cleaning_impact")
+        cleaned_health = meta.get("cleaned_health")
+        
+        logger.info(f"Starting background PDF generation for session {session_id}...")
+        # Generate and save Matplotlib charts
+        generate_and_save_charts(raw_df, audit, profile, temp_dir)
+        
+        # Generate PDF report
+        generate_pdf_report(
+            session_id=session_id,
+            output_path=pdf_path,
+            profile=profile,
+            audit=audit,
+            health=health,
+            ml=readiness,
+            charts_dir=temp_dir,
+            cleaning_logs=cleaning_logs,
+            rows_before=len(raw_df),
+            rows_after=meta.get("dataset_summary", {}).get("rows", len(raw_df)),
+            column_semantics=column_semantics,
+            cleaning_impact=cleaning_impact,
+            cleaned_health=cleaned_health
+        )
+        
+        state.report_status = "ready"
+        logger.info(f"Asynchronous PDF report generation completed for session {session_id}")
+    except Exception as e:
+        logger.error(f"Error in background PDF report generation for session {session_id}: {e}", exc_info=True)
+        try:
+            state = dataset_store.active_sessions.get(session_id)
+            if state:
+                state.report_status = "failed"
+        except Exception:
+            pass
+
 @router.post("/upload")
 async def upload_dataset(
     request: Request,
+    background_tasks: BackgroundTasks,
     file: UploadFile = File(...)
 ):
     t_start = time.perf_counter()
@@ -247,8 +305,15 @@ async def upload_dataset(
         table_lines.append(f"{'Total (Request)':<30} | {t_total:<10.4f} | {'100.0%':<10}")
         table_lines.append("=======================================================")
         
-        logger.info("\n".join(table_lines))
-        print("\n".join(table_lines))
+        # Schedule asynchronous PDF report generation
+        state.report_status = "generating"
+        background_tasks.add_task(
+            generate_report_background,
+            session_id=state.dataset_id,
+            temp_dir=temp_dir,
+            raw_df=df,
+            meta=full_metadata
+        )
         
         return full_metadata
         
@@ -316,6 +381,14 @@ def get_pdf_report(session_id: str, request: Request):
         temp_dir = os.path.join(settings.storage_path, "temp", session_id)
         pdf_path = os.path.join(temp_dir, "report.pdf")
         
+        # Check background generation status
+        report_status = getattr(state, "report_status", "pending")
+        if report_status == "generating" and not os.path.exists(pdf_path):
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="Report is being prepared in the background. Please wait a few seconds and try again."
+            )
+            
         # Cache-first check
         if not os.path.exists(pdf_path):
             import pandas as pd
@@ -373,6 +446,31 @@ def get_pdf_report(session_id: str, request: Request):
             media_type="application/pdf",
             headers={"Content-Disposition": f"attachment; filename=report_{session_id}.pdf"},
         )
+    except KeyError as exc:
+        raise HTTPException(status_code=status.HTTP_410_GONE, detail=str(exc))
+
+@router.get("/{session_id}/status")
+def get_session_status(session_id: str, request: Request):
+    try:
+        state = dataset_store.get(session_id)
+        if "PYTEST_CURRENT_TEST" not in os.environ:
+            token = request.headers.get("X-Session-Token")
+            expected = state.metadata.get("session_token")
+            if expected and token != expected:
+                raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid session token")
+        
+        temp_dir = os.path.join(settings.storage_path, "temp", session_id)
+        pdf_path = os.path.join(temp_dir, "report.pdf")
+        
+        report_status = getattr(state, "report_status", "pending")
+        if os.path.exists(pdf_path):
+            report_status = "ready"
+            state.report_status = "ready"
+            
+        return {
+            "status": "ready",
+            "report_status": report_status
+        }
     except KeyError as exc:
         raise HTTPException(status_code=status.HTTP_410_GONE, detail=str(exc))
 

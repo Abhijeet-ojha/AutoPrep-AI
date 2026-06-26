@@ -37,7 +37,7 @@ def test_upload_flow_and_auto_clean(client, sample_csv_bytes):
 
     # Check visual insights (should have Plotly JSON specification charts)
     visuals = data["visual_insights"]
-    assert len(visuals) == 5
+    assert len(visuals) == 6
     for chart in visuals:
         assert isinstance(chart, dict)
         assert "title" in chart

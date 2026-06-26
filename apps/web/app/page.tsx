@@ -82,8 +82,10 @@ export default function LandingPage() {
 
   if (loading) {
     return (
-      <div className="h-screen overflow-hidden flex flex-col items-center justify-center bg-zinc-950 px-4 text-zinc-50">
-        <div className="flex flex-col items-center space-y-6 max-w-md text-center">
+      <div className="relative h-screen overflow-hidden flex flex-col items-center justify-center bg-zinc-950 px-4 text-zinc-50">
+        {/* Background Ambient Glows */}
+        <div className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 w-[500px] h-[500px] rounded-full bg-red-500/[0.03] blur-[150px] pointer-events-none" />
+        <div className="flex flex-col items-center space-y-6 max-w-md text-center z-10">
           <div className="relative flex h-20 w-20 items-center justify-center">
             <div className="absolute h-full w-full rounded-full border-4 border-zinc-800" />
             <div className="absolute h-full w-full rounded-full border-4 border-t-red-500 animate-spin" />
@@ -108,9 +110,12 @@ export default function LandingPage() {
   }
 
   return (
-    <div className="h-screen overflow-hidden flex flex-col items-center justify-center bg-zinc-950 text-zinc-50 px-4">
+    <div className="relative h-screen overflow-hidden flex flex-col items-center justify-center bg-zinc-950 text-zinc-50 px-4">
+      {/* Background Ambient Glows */}
+      <div className="absolute top-1/4 left-1/4 -translate-x-1/2 -translate-y-1/2 w-96 h-96 rounded-full bg-red-500/[0.04] blur-[120px] pointer-events-none" />
+      <div className="absolute bottom-1/4 right-1/4 translate-x-1/2 translate-y-1/2 w-96 h-96 rounded-full bg-cyan-500/[0.03] blur-[120px] pointer-events-none" />
       {/* Main Content */}
-      <main className="flex flex-col items-center justify-center max-w-xl w-full space-y-8 animate-fade-in">
+      <main className="flex flex-col items-center justify-center max-w-xl w-full space-y-8 animate-fade-in z-10">
         {/* Hero Section */}
         <div className="space-y-4 text-center">
           <h1 className="title text-5xl font-extrabold tracking-tight sm:text-6xl bg-gradient-to-r from-zinc-50 via-zinc-200 to-red-500 bg-clip-text text-transparent select-none">

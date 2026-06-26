@@ -2267,5 +2267,39 @@ def generate_plotly_insights(df: pd.DataFrame, audit: dict[str, Any], profile: d
         }
     })
 
+    # 6. Data Type Distribution
+    roles = profile.get("roles", {})
+    type_labels = ["Numerical", "Categorical", "Date/Time", "Boolean", "Text"]
+    type_counts = [
+        len(roles.get("numerical", [])),
+        len(roles.get("categorical", [])),
+        len(roles.get("date", [])),
+        len(roles.get("boolean", [])),
+        len(roles.get("text", []))
+    ]
+    filtered_types = [(lbl, cnt) for lbl, cnt in zip(type_labels, type_counts) if cnt > 0]
+    if not filtered_types:
+        filtered_types = [("Unknown", 0)]
+    
+    x_types = [f[0] for f in filtered_types]
+    y_types = [f[1] for f in filtered_types]
+
+    insights.append({
+        "title": "Data Type Distribution",
+        "data": [
+            {
+                "x": x_types,
+                "y": y_types,
+                "type": "bar",
+                "marker": {"color": "#6366f1"}
+            }
+        ],
+        "layout": {
+            "title": "Data Type Count by Column Role",
+            "xaxis": {"title": "Data Type", "type": "category", "automargin": True},
+            "yaxis": {"title": "Number of Columns", "automargin": True}
+        }
+    })
+
     return insights
 

@@ -18,7 +18,7 @@ export const ChatWorkspace: React.FC<ChatWorkspaceProps> = React.memo(({
   // If embedded, we want the default container styles.
   const containerClasses = isPortalInstance
     ? "flex flex-col h-full w-full bg-slate-50/30 dark:bg-zinc-950/20"
-    : "flex flex-col h-[520px] border border-slate-200 dark:border-zinc-800 rounded-2xl bg-slate-50/50 dark:bg-zinc-900/30 overflow-hidden shadow-inner transition-all duration-300";
+    : "flex flex-col h-[700px] border border-slate-200 dark:border-zinc-800 rounded-2xl bg-slate-50/50 dark:bg-zinc-900/30 overflow-hidden shadow-inner transition-all duration-300";
 
   return (
     <div className={containerClasses}>

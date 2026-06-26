@@ -4,7 +4,7 @@ import React, { useEffect, useState, useMemo, Suspense } from "react";
 import dynamic from "next/dynamic";
 import Link from "next/link";
 import { useRouter, useSearchParams } from "next/navigation";
-import { downloadCleanedCSV, downloadReport, downloadCleaningLog } from "@/lib/api";
+import { downloadCleanedCSV, downloadReport, downloadCleaningLog, getJSON } from "@/lib/api";
 import { 
   Database, 
   LayoutGrid, 
@@ -33,7 +33,7 @@ const Plot = dynamic(() => import("react-plotly.js"), {
 const ChatPanel = dynamic(() => import("@/components/ChatPanel").then(mod => mod.ChatPanel), {
   ssr: false,
   loading: () => (
-    <div className="h-[520px] w-full rounded-2xl bg-slate-100 dark:bg-zinc-800 animate-pulse flex flex-col items-center justify-center text-slate-400 dark:text-zinc-500 space-y-2">
+    <div className="h-[700px] w-full rounded-2xl bg-slate-100 dark:bg-zinc-800 animate-pulse flex flex-col items-center justify-center text-slate-400 dark:text-zinc-500 space-y-2">
       <div className="h-6 w-6 rounded-full border-2 border-slate-300 dark:border-zinc-600 border-t-red-500 animate-spin" />
       <span className="text-xs font-semibold">Loading Copilot...</span>
     </div>
@@ -167,6 +167,7 @@ function ResultsContent() {
   const [showAuditModal, setShowAuditModal] = useState(false);
   const [activeTab, setActiveTab] = useState<"findings" | "impact">("findings");
   const [error, setError] = useState<string | null>(null);
+  const [reportStatus, setReportStatus] = useState<"pending" | "generating" | "ready" | "failed">("pending");
   const [activeChartModal, setActiveChartModal] = useState<number | null>(null);
 
   // Keypress listeners are handled internally by dynamic modal components
@@ -188,6 +189,33 @@ function ResultsContent() {
       console.error("Failed to read sessionStorage results", e);
       setSessionExpired(true);
     }
+  }, [sessionId]);
+
+  useEffect(() => {
+    if (!sessionId) return;
+    
+    let intervalId: any;
+    
+    const checkStatus = async () => {
+      try {
+        const response = await getJSON(`/datasets/${sessionId}/status`);
+        if (response && response.report_status) {
+          setReportStatus(response.report_status);
+          if (response.report_status === "ready" || response.report_status === "failed") {
+            clearInterval(intervalId);
+          }
+        }
+      } catch (err) {
+        console.error("Failed to check report status", err);
+      }
+    };
+    
+    checkStatus();
+    intervalId = setInterval(checkStatus, 2000);
+    
+    return () => {
+      if (intervalId) clearInterval(intervalId);
+    };
   }, [sessionId]);
 
   const totalMissing = useMemo(() => {
@@ -333,7 +361,10 @@ function ResultsContent() {
     : "text-red-500 stroke-red-500";
 
   return (
-    <div className="mx-auto max-w-7xl px-4 py-6 md:px-6 space-y-8 pb-16">
+    <div className="relative mx-auto max-w-7xl px-4 py-6 md:px-6 space-y-8 pb-16">
+      {/* Background Ambient Glows */}
+      <div className="absolute top-1/4 left-1/4 -translate-x-1/2 -translate-y-1/2 w-96 h-96 rounded-full bg-red-500/[0.03] dark:bg-red-500/[0.015] blur-[100px] pointer-events-none" />
+      <div className="absolute bottom-1/4 right-1/4 translate-x-1/2 translate-y-1/2 w-96 h-96 rounded-full bg-cyan-500/[0.03] dark:bg-cyan-500/[0.015] blur-[100px] pointer-events-none" />
       {/* Top Navigation */}
       <header className="flex justify-between items-center w-full py-4 border-b border-slate-200/60 dark:border-zinc-800/60">
         <div className="flex items-center gap-4">
@@ -581,6 +612,46 @@ function ResultsContent() {
               </div>
             </div>
 
+            {/* Report Preparation Status Indicator */}
+            <div className="flex flex-col md:flex-row items-start md:items-center justify-between gap-4 p-4 rounded-xl bg-slate-50 dark:bg-zinc-900/50 border border-slate-200/60 dark:border-zinc-800/60 text-xs font-semibold">
+              <div className="flex flex-col gap-2">
+                <span className="text-slate-500 dark:text-zinc-400 uppercase tracking-wider text-[10px] font-extrabold">Report Engine Status</span>
+                <div className="flex flex-wrap gap-x-4 gap-y-2 text-slate-700 dark:text-zinc-300">
+                  <span className="flex items-center gap-1.5 text-emerald-600 dark:text-emerald-400">
+                    <CheckCircle2 className="h-4 w-4 shrink-0" />
+                    Dataset processed
+                  </span>
+                  
+                  {reportStatus === "ready" && (
+                    <span className="flex items-center gap-1.5 text-emerald-600 dark:text-emerald-400">
+                      <CheckCircle2 className="h-4 w-4 shrink-0" />
+                      Report ready
+                    </span>
+                  )}
+                  {(reportStatus === "pending" || reportStatus === "generating") && (
+                    <span className="flex items-center gap-1.5 text-amber-500 dark:text-amber-400">
+                      <span className="animate-spin text-sm shrink-0">⏳</span>
+                      Preparing downloadable report in background...
+                    </span>
+                  )}
+                  {reportStatus === "failed" && (
+                    <span className="flex items-center gap-1.5 text-red-500 dark:text-red-400">
+                      <AlertCircle className="h-4 w-4 shrink-0" />
+                      Report preparation failed
+                    </span>
+                  )}
+                </div>
+              </div>
+              
+              {/* Spinning status spinner */}
+              {(reportStatus === "pending" || reportStatus === "generating") && (
+                <div className="flex items-center gap-2 text-slate-500 dark:text-zinc-400">
+                  <div className="h-3 w-3 border border-amber-500 border-t-transparent rounded-full animate-spin" />
+                  <span className="text-[10px] font-medium animate-pulse">building pdf...</span>
+                </div>
+              )}
+            </div>
+
             {/* Error log if download crashes */}
             {error && (
               <div className="flex items-start gap-3 bg-red-50 dark:bg-red-950/20 border border-red-100 dark:border-red-900/30 p-4 rounded-xl text-red-600 dark:text-red-400 text-xs font-semibold leading-normal animate-fade-in">
@@ -614,12 +685,17 @@ function ResultsContent() {
               
               <button
                 onClick={handleReport}
-                disabled={reporting}
+                disabled={reporting || (reportStatus !== "ready" && reportStatus !== "failed")}
                 className="flex-1 flex items-center justify-center gap-2 rounded-xl border border-slate-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 hover:bg-slate-50 dark:hover:bg-zinc-800 text-slate-700 dark:text-zinc-300 h-12 text-sm font-extrabold shadow-sm transition-all disabled:opacity-50 active:scale-[0.98]"
               >
                 {reporting ? (
                   <>
                     <div className="h-4 w-4 border-2 border-slate-700 dark:border-zinc-300 border-t-transparent animate-spin rounded-full" />
+                    Preparing Report...
+                  </>
+                ) : reportStatus === "generating" || reportStatus === "pending" ? (
+                  <>
+                    <div className="h-4 w-4 border-2 border-amber-500 border-t-transparent animate-spin rounded-full" />
                     Preparing Report...
                   </>
                 ) : (
