@@ -91,40 +91,49 @@ def test_metadata_endpoint(client, sample_csv_bytes):
     assert resp_bad.status_code == 410
 
 
-def test_download_and_immediate_eviction(client, sample_csv_bytes):
-    """Critical Privacy Test: Verify download streams CSV and immediately deletes the session."""
+def test_download_and_session_persistence(client, sample_csv_bytes):
+    """Bug Fix Test: Verify that downloading the CSV does NOT delete the session.
+
+    After downloading the cleaned CSV:
+    - The session must still be accessible in the store
+    - The temp directory must still exist on disk
+    - The metadata endpoint must still return 200
+    - A second download must also succeed (repeat-download support)
+    """
     dataset_store.active_sessions.clear()
 
     resp_up = client.post(
         "/datasets/upload",
         files={"file": ("test_down.csv", sample_csv_bytes, "text/csv")}
     )
+    assert resp_up.status_code == 200
     dataset_id = resp_up.json()["dataset_summary"]["dataset_id"]
 
-    # File must exist under storage/temp
     temp_dir = os.path.join(settings.storage_path, "temp", dataset_id)
-    assert os.path.exists(temp_dir)
+    assert os.path.exists(temp_dir), "temp_dir must exist after upload"
 
-    # Download file
+    # First CSV download
     resp_down = client.get(f"/datasets/{dataset_id}/download")
     assert resp_down.status_code == 200
     assert "text/csv" in resp_down.headers["content-type"]
     assert "test_down_cleaned.csv" in resp_down.headers["content-disposition"]
-    
-    csv_content = resp_down.content.decode("utf-8")
-    assert "Alice" in csv_content
+    assert "Alice" in resp_down.content.decode("utf-8")
 
-    # Privacy guarantee checks:
-    # 1. State must be evicted from memory
-    with pytest.raises(KeyError):
-        dataset_store.get(dataset_id)
+    # Session must still be alive after download (Bug 1 fix)
+    state = dataset_store.get(dataset_id)  # must NOT raise KeyError
+    assert state is not None
 
-    # 2. Temp directories must be physically deleted from disk
-    assert not os.path.exists(temp_dir)
+    # Temp directory must still exist on disk
+    assert os.path.exists(temp_dir), "temp_dir must NOT be deleted after download"
 
-    # 3. Subsequent calls return 410 GONE
-    resp_gone = client.get(f"/datasets/{dataset_id}/metadata")
-    assert resp_gone.status_code == 410
+    # Metadata endpoint must still return 200
+    resp_meta = client.get(f"/datasets/{dataset_id}/metadata")
+    assert resp_meta.status_code == 200
+
+    # Repeat download must also succeed
+    resp_down2 = client.get(f"/datasets/{dataset_id}/download")
+    assert resp_down2.status_code == 200
+    assert "Alice" in resp_down2.content.decode("utf-8")
 
 
 def test_pdf_report_rendering(client, sample_csv_bytes):

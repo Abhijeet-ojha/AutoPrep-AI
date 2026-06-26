@@ -265,17 +265,14 @@ function ResultsContent() {
     setDownloading(true);
     try {
       await downloadCleanedCSV(data.dataset_summary.dataset_id, data.dataset_summary.filename);
-      // Evict credentials from sessionStorage immediately upon download completion for privacy-first
-      sessionStorage.removeItem("autoprep_session_id");
-      sessionStorage.removeItem("autoprep_session_token");
-      sessionStorage.removeItem("autoprep_results");
-      
-      // Delay briefly then push back to landing or show expired
-      setTimeout(() => {
-        router.push("/");
-      }, 1000);
+      // Session remains active so the user can still:
+      // - download the PDF report
+      // - use the AI Copilot
+      // - download the CSV again
+      // Cleanup happens automatically via the server-side session expiration scheduler.
     } catch (err) {
       setError(err instanceof Error ? err.message : "Download failed. The session may have expired.");
+    } finally {
       setDownloading(false);
     }
   };
@@ -605,9 +602,9 @@ function ResultsContent() {
             <div className="flex items-start gap-3 bg-amber-50 dark:bg-amber-950/20 border border-amber-100 dark:border-amber-900/30 p-4 rounded-xl text-amber-600 dark:text-amber-400 text-xs font-semibold leading-relaxed">
               <AlertCircle className="h-5 w-5 shrink-0 mt-0.5" />
               <div>
-                <p className="font-bold uppercase tracking-wider mb-0.5">Privacy Action Reminder</p>
+                <p className="font-bold uppercase tracking-wider mb-0.5">Session Expiration Notice</p>
                 <p className="text-slate-500 dark:text-zinc-400 font-medium">
-                  Files are automatically deleted after download or session expiration. Once you click download, all cached files and session state are immediately wiped from our servers.
+                  All files are automatically deleted after your session expires. You can download the CSV, PDF report, and cleaning log independently — downloading one does not remove the others.
                 </p>
               </div>
             </div>

@@ -417,29 +417,44 @@ def download_cleaned(
         if not os.path.exists(file_path):
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Cleaned CSV not found on disk")
         
+        file_size = os.path.getsize(file_path)
+        
         def iter_file():
             with open(file_path, mode="rb") as f:
                 yield from f
-            # Once download completes, delete the session and files immediately
-            dataset_store.delete(session_id)
+            # NOTE: Do NOT delete the session here. Let the expiration scheduler handle cleanup.
+            # Deleting here would break subsequent PDF downloads, AI Copilot usage, and repeat CSV downloads.
             
         return StreamingResponse(
             iter_file(),
             media_type="text/csv",
-            headers={"Content-Disposition": f"attachment; filename={state.file_name.rsplit('.', 1)[0]}_cleaned.csv"},
+            headers={
+                "Content-Disposition": f"attachment; filename={state.file_name.rsplit('.', 1)[0]}_cleaned.csv",
+                "Content-Length": str(file_size),
+            },
         )
     elif file_type == "pdf":
         pdf_path = os.path.join(temp_dir, "report.pdf")
         
-        # Check background generation status
+        # If the background task is still generating, wait up to 30 s for it to finish
+        # before falling back to synchronous generation. This avoids the race condition
+        # where the user clicks Download Report right after upload completes.
         report_status = getattr(state, "report_status", "pending")
-        if report_status == "generating" and not os.path.exists(pdf_path):
-            raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT,
-                detail="Report is being prepared in the background. Please wait a few seconds and try again."
-            )
-            
-        # Cache-first check
+        if not os.path.exists(pdf_path) and report_status == "generating":
+            logger.info(f"PDF not ready yet for session {session_id}; waiting up to 30s for background task...")
+            waited = 0
+            import asyncio
+            while not os.path.exists(pdf_path) and waited < 30:
+                time.sleep(1)
+                waited += 1
+                # Re-read status in case background task updated it
+                report_status = getattr(state, "report_status", "generating")
+                if report_status in ("ready", "failed"):
+                    break
+            if not os.path.exists(pdf_path):
+                logger.warning(f"PDF still not ready after {waited}s for session {session_id}; generating synchronously.")
+        
+        # Synchronous fallback: generate PDF if not yet on disk
         if not os.path.exists(pdf_path):
             import pandas as pd
             
@@ -464,6 +479,7 @@ def download_cleaned(
             cleaning_impact = meta.get("cleaning_impact")
             cleaned_health = meta.get("cleaned_health")
             
+            logger.info(f"Generating PDF synchronously for session {session_id}...")
             # Generate and save Matplotlib charts
             generate_and_save_charts(raw_df, audit, profile, temp_dir)
             
@@ -483,9 +499,12 @@ def download_cleaned(
                 cleaning_impact=cleaning_impact,
                 cleaned_health=cleaned_health
             )
+            state.report_status = "ready"
             
         if not os.path.exists(pdf_path):
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Report PDF not found")
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Report PDF could not be generated")
+        
+        pdf_size = os.path.getsize(pdf_path)
             
         def iter_file():
             with open(pdf_path, mode="rb") as f:
@@ -494,7 +513,10 @@ def download_cleaned(
         return StreamingResponse(
             iter_file(),
             media_type="application/pdf",
-            headers={"Content-Disposition": f"attachment; filename=report_{session_id}.pdf"},
+            headers={
+                "Content-Disposition": f"attachment; filename=report_{session_id}.pdf",
+                "Content-Length": str(pdf_size),
+            },
         )
     else:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Unsupported file type.")
