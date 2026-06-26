@@ -337,17 +337,8 @@ AutoPrep AI/
 
 ---
 
-## 15. Future Improvements
 
-*   **Celery Background Queue:** Offload heavy dataset cleansing (>100MB) to distributed worker pools.
-*   **User Authentication:** Save cleaning histories, datasets, and chat sessions per user account.
-*   **Dataset Versioning:** Track a history of dataset cleaning iterations with easy rollback.
-*   **SQL DB Integration:** Allow importing raw data directly from PostgreSQL, MySQL, or Snowflake.
-*   **HuggingFace Datasets:** Enable loading datasets directly from the HuggingFace Hub.
-
----
-
-## 16. License & Contact
+## 15. License & Contact
 
 Distributed under the MIT License. See `LICENSE` for more information.
 
