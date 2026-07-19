@@ -371,5 +371,3 @@ AutoPrep AI/
 Distributed under the MIT License. See `LICENSE` for more information.
 
 *   **Author:** Abhijeet Ojha
-*   **GitHub:** [https://github.com/abhijeetojha](https://github.com/abhijeetojha)
-*   **LinkedIn:** [https://linkedin.com/in/abhijeetojha](https://linkedin.com/in/abhijeetojha)
